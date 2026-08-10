@@ -840,10 +840,8 @@ struct AppServicesDependencyTests {
     }
 
     @Test
-    func debugBuildFallsBackToLoginKeychainOnlyForMissingEntitlement() {
-        #if DEBUG
+    func fallsBackToLoginKeychainOnlyForMissingEntitlement() {
         #expect(SystemKeychainService.shouldUseLegacyWriteFallback(for: errSecMissingEntitlement))
-        #endif
         #expect(!SystemKeychainService.shouldUseLegacyWriteFallback(for: errSecAuthFailed))
         #expect(!SystemKeychainService.shouldUseLegacyWriteFallback(for: errSecInteractionNotAllowed))
     }
