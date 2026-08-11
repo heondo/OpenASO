@@ -1239,11 +1239,31 @@ final class RankingRefreshCoordinator: Sendable {
         let requestGroups = RankingRequestGroup.normalizedGroups(for: tracks.map(RankingRefreshRequest.init))
 
         for requestGroup in requestGroups {
+            // A cancelled refresh stops dispatching new provider work. Results
+            // already persisted by earlier iterations stay committed; tracks
+            // not yet reached are left untouched rather than marked failed, so
+            // a stopped run reads as "partial" rather than "errored" downstream.
+            if Task.isCancelled {
+                break
+            }
+
             let result = await refreshPage(
                 for: requestGroup.providerRequest,
                 limit: SearchRankingCrawl.fullKeywordRankingLimit,
                 recordsTrigger: false
             )
+
+            // The group that was still in flight when cancellation arrived gets
+            // the same treatment. `fetchRankingPage` re-checks cancellation
+            // after the provider await and `refreshPage` maps that
+            // `CancellationError` into a `.failure`, so without this second
+            // check a stopped run would write a real "Ranking failed to
+            // refresh" status and a failed outcome for whichever keyword the
+            // user happened to interrupt.
+            if Task.isCancelled {
+                break
+            }
+
             switch result {
             case .success(let pageResult):
                 for targetPageResult in requestGroup.pageResults(fanningOut: pageResult) {

@@ -21,6 +21,8 @@ struct AppDetailView: View {
 
     @State private var isPresentingAddKeywords = false
     @State private var isRefreshingApp = false
+    @State private var isStoppingRefresh = false
+    @State private var activeRefreshTask: Task<Void, Never>?
     @State private var errorMessage: String?
     @State private var searchText = ""
     @State private var selectedWorkspaceView = AppDetailWorkspaceView.keywords
@@ -90,9 +92,11 @@ struct AppDetailView: View {
                 AppDetailRefreshToolbarButton(
                     isRefreshing: isRefreshingApp,
                     isDisabled: isRefreshDisabled,
+                    isStoppingRefresh: isStoppingRefresh,
                     action: refreshApp,
                     refreshAllStorefrontsAction: refreshAllStorefronts,
                     refreshAllAppsAction: refreshAllApps,
+                    stopAction: stopRefresh,
                     help: refreshHelp
                 )
                 AppDetailWorkspaceViewPicker(selectedWorkspaceView: $selectedWorkspaceView)
@@ -252,7 +256,7 @@ struct AppDetailView: View {
             "Refresh tapped appStoreID=\(appStoreID, privacy: .public) appName=\(appName, privacy: .public) view=\(activeWorkspaceView.title, privacy: .public) selectedStorefront=\(selectedStorefrontFilter.title, privacy: .public) storefrontCount=\(request.storefrontSelection.codes.count, privacy: .public) keywords=\(request.trackIdentityKeys.count, privacy: .public)"
         )
 
-        Task(priority: .userInitiated) {
+        activeRefreshTask = Task(priority: .userInitiated) {
             let result = await refreshService.refresh(request)
 
             await MainActor.run {
@@ -262,11 +266,19 @@ struct AppDetailView: View {
                 keywordRefreshToken += 1
                 ratingsRefreshToken += 1
 
-                OpenASOLog.appDetail.info(
-                    "Refresh finished appStoreID=\(appStoreID, privacy: .public) ratingSuccesses=\(result.ratingOutcomes.filter { $0.error == nil }.count, privacy: .public) ratingFailures=\(result.ratingOutcomes.filter { $0.error != nil }.count, privacy: .public) reviewSuccesses=\(result.reviewOutcomes.filter { $0.error == nil }.count, privacy: .public) reviewFailures=\(result.reviewOutcomes.filter { $0.error != nil }.count, privacy: .public) keywordFailures=\(result.keywordOutcomes.filter { $0.error != nil }.count, privacy: .public)"
-                )
+                if result.wasCancelled {
+                    OpenASOLog.appDetail.info(
+                        "Refresh stopped appStoreID=\(appStoreID, privacy: .public) appName=\(appName, privacy: .public)"
+                    )
+                } else {
+                    OpenASOLog.appDetail.info(
+                        "Refresh finished appStoreID=\(appStoreID, privacy: .public) ratingSuccesses=\(result.ratingOutcomes.filter { $0.error == nil }.count, privacy: .public) ratingFailures=\(result.ratingOutcomes.filter { $0.error != nil }.count, privacy: .public) reviewSuccesses=\(result.reviewOutcomes.filter { $0.error == nil }.count, privacy: .public) reviewFailures=\(result.reviewOutcomes.filter { $0.error != nil }.count, privacy: .public) keywordFailures=\(result.keywordOutcomes.filter { $0.error != nil }.count, privacy: .public)"
+                    )
+                }
                 isRefreshingApp = false
-                flushQueuedKeywordAdds()
+                isStoppingRefresh = false
+                activeRefreshTask = nil
+                flushQueuedKeywordAdds(startsFollowUpRefresh: !result.wasCancelled)
             }
         }
     }
@@ -294,16 +306,26 @@ struct AppDetailView: View {
             "Refresh all tapped startingAppStoreID=\(appStoreID, privacy: .public) view=\(activeWorkspaceView.title, privacy: .public) selectedStorefront=\(selectedStorefrontFilter.title, privacy: .public) appCount=\(requests.count, privacy: .public)"
         )
 
-        Task(priority: .userInitiated) {
+        activeRefreshTask = Task(priority: .userInitiated) {
             var firstError: OpenASOError?
             var ratingSuccesses = 0
             var ratingFailures = 0
             var reviewSuccesses = 0
             var reviewFailures = 0
             var keywordFailures = 0
+            var wasCancelled = false
 
             for request in requests {
+                if Task.isCancelled {
+                    wasCancelled = true
+                    break
+                }
+
                 let result = await refreshService.refresh(request)
+                if result.wasCancelled {
+                    wasCancelled = true
+                    break
+                }
                 if firstError == nil {
                     firstError = result.firstError
                 }
@@ -328,11 +350,19 @@ struct AppDetailView: View {
                 keywordRefreshToken += 1
                 ratingsRefreshToken += 1
 
-                OpenASOLog.appDetail.info(
-                    "Refresh all finished startingAppStoreID=\(appStoreID, privacy: .public) appCount=\(requests.count, privacy: .public) ratingSuccesses=\(ratingSuccesses, privacy: .public) ratingFailures=\(ratingFailures, privacy: .public) reviewSuccesses=\(reviewSuccesses, privacy: .public) reviewFailures=\(reviewFailures, privacy: .public) keywordFailures=\(keywordFailures, privacy: .public)"
-                )
+                if wasCancelled {
+                    OpenASOLog.appDetail.info(
+                        "Refresh all stopped startingAppStoreID=\(appStoreID, privacy: .public) appCount=\(requests.count, privacy: .public)"
+                    )
+                } else {
+                    OpenASOLog.appDetail.info(
+                        "Refresh all finished startingAppStoreID=\(appStoreID, privacy: .public) appCount=\(requests.count, privacy: .public) ratingSuccesses=\(ratingSuccesses, privacy: .public) ratingFailures=\(ratingFailures, privacy: .public) reviewSuccesses=\(reviewSuccesses, privacy: .public) reviewFailures=\(reviewFailures, privacy: .public) keywordFailures=\(keywordFailures, privacy: .public)"
+                    )
+                }
                 isRefreshingApp = false
-                flushQueuedKeywordAdds()
+                isStoppingRefresh = false
+                activeRefreshTask = nil
+                flushQueuedKeywordAdds(startsFollowUpRefresh: !wasCancelled)
             }
         }
     }
@@ -346,7 +376,15 @@ struct AppDetailView: View {
         flushQueuedKeywordAdds()
     }
 
-    private func flushQueuedKeywordAdds() {
+    /// Inserts any keywords the user queued while a refresh was running.
+    ///
+    /// `startsFollowUpRefresh` is false when the run that just ended was
+    /// stopped by the user. The keywords are still inserted so the queued work
+    /// is not lost, but the `after_add_keyword` refresh is not launched: that
+    /// task is not owned by `activeRefreshTask` and does not surface a Stop
+    /// button, so chaining it off a cancelled run would make Stop start a
+    /// refresh the user cannot stop.
+    private func flushQueuedKeywordAdds(startsFollowUpRefresh: Bool = true) {
         guard !queuedKeywordAdds.isEmpty, !isRefreshInProgress, !isFlushingQueuedKeywordAdds else {
             return
         }
@@ -355,11 +393,14 @@ struct AppDetailView: View {
         let requests = queuedKeywordAdds
         queuedKeywordAdds.removeAll()
         services.refreshProgressStore.clearPendingKeywordAdditions(appStoreID: appStoreID)
-        addQueuedKeywordTracks(requests)
+        addQueuedKeywordTracks(requests, startsFollowUpRefresh: startsFollowUpRefresh)
         isFlushingQueuedKeywordAdds = false
     }
 
-    private func addQueuedKeywordTracks(_ requests: [KeywordAddRequest]) {
+    private func addQueuedKeywordTracks(
+        _ requests: [KeywordAddRequest],
+        startsFollowUpRefresh: Bool = true
+    ) {
         let existingKeys: Set<String>
         do {
             existingKeys = try existingKeywordDuplicateKeys()
@@ -430,7 +471,7 @@ struct AppDetailView: View {
             storefrontCount: requestedStorefrontCodes.count
         ))
 
-        guard let refreshService = services.appDetailRefreshService else {
+        guard startsFollowUpRefresh, let refreshService = services.appDetailRefreshService else {
             return
         }
 
@@ -590,6 +631,12 @@ struct AppDetailView: View {
             appleAdsWebSession: appleAdsWebSession,
             appStoreConnectCredentials: services.appStoreConnectCredentialStore.credentials
         )
+    }
+
+    private func stopRefresh() {
+        guard isRefreshingApp, !isStoppingRefresh, let activeRefreshTask else { return }
+        isStoppingRefresh = true
+        activeRefreshTask.cancel()
     }
 
     private var refreshHelp: String {

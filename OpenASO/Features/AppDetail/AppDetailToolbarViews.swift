@@ -4,29 +4,46 @@ import SwiftUI
 struct AppDetailRefreshToolbarButton: View {
     let isRefreshing: Bool
     let isDisabled: Bool
+    let isStoppingRefresh: Bool
     let action: () -> Void
     let refreshAllStorefrontsAction: () -> Void
     let refreshAllAppsAction: () -> Void
+    let stopAction: () -> Void
     let help: String
 
     var body: some View {
-        Menu {
-            Button(action: refreshAllStorefrontsAction) {
-                Label("Refresh All Storefronts", systemImage: "globe")
-            }
-            .disabled(isDisabled)
+        HStack(spacing: 6) {
+            Menu {
+                Button(action: refreshAllStorefrontsAction) {
+                    Label("Refresh All Storefronts", systemImage: "globe")
+                }
+                .disabled(isDisabled)
 
-            Button(action: refreshAllAppsAction) {
-                Label("Refresh All Apps (Focused Countries)", systemImage: "arrow.triangle.2.circlepath")
+                Button(action: refreshAllAppsAction) {
+                    Label("Refresh All Apps (Focused Countries)", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(isDisabled)
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            } primaryAction: {
+                action()
             }
             .disabled(isDisabled)
-        } label: {
-            Label("Refresh", systemImage: "arrow.clockwise")
-        } primaryAction: {
-            action()
+            .help(help)
+
+            if isRefreshing {
+                if isStoppingRefresh {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Stopping refresh")
+                } else {
+                    Button(action: stopAction) {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .help("Stop Refresh")
+                }
+            }
         }
-        .disabled(isDisabled)
-        .help(help)
     }
 }
 

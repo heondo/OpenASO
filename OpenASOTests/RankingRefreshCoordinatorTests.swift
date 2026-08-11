@@ -1813,6 +1813,200 @@ struct RankingRefreshCoordinatorTests {
         #expect(storefronts.first(where: { $0.code == "us" })?.name == "United States")
         #expect(storefronts.first(where: { $0.code == "us" })?.flagEmoji == "🇺🇸")
     }
+
+    /// Covers `RankingRefreshCoordinator.refresh(tracks:in:analyticsTrigger:progress:)`,
+    /// the serial refresh entry point behind `refreshStaleTracks`. Nothing in the
+    /// shipping app reaches this overload today -- manual, daily, and MCP refreshes
+    /// all go through `AppDetailRefreshService` -- so this pins the overload's
+    /// cancellation contract rather than a user-facing Stop. The Stop button's own
+    /// path is covered by
+    /// `cancellingKeywordRefreshLeavesNoRankingSnapshotsOrFailureStatuses()`.
+    @Test
+    func cancellingMidRunStopsDispatchAndLeavesRemainingTracksUntouched() async throws {
+        let container = try makeInMemoryContainer()
+        let modelContext = ModelContext(container)
+        modelContext.autosaveEnabled = false
+
+        let firstApp = TrackedApp(
+            appStoreID: 501,
+            bundleID: "example.cancel.501",
+            name: "First",
+            sellerName: "Example",
+            defaultPlatform: .iphone
+        )
+        let firstTrack = try makeTrackedAppKeyword(term: "alpha keyword", trackedApp: firstApp, in: modelContext)
+        firstApp.keywordTracks.append(firstTrack)
+        modelContext.insert(firstApp)
+        modelContext.insert(firstTrack)
+
+        let secondApp = TrackedApp(
+            appStoreID: 502,
+            bundleID: "example.cancel.502",
+            name: "Second",
+            sellerName: "Example",
+            defaultPlatform: .iphone
+        )
+        let secondTrack = try makeTrackedAppKeyword(term: "bravo keyword", trackedApp: secondApp, in: modelContext)
+        secondApp.keywordTracks.append(secondTrack)
+        modelContext.insert(secondApp)
+        modelContext.insert(secondTrack)
+
+        let thirdApp = TrackedApp(
+            appStoreID: 503,
+            bundleID: "example.cancel.503",
+            name: "Third",
+            sellerName: "Example",
+            defaultPlatform: .iphone
+        )
+        let thirdTrack = try makeTrackedAppKeyword(term: "charlie keyword", trackedApp: thirdApp, in: modelContext)
+        thirdApp.keywordTracks.append(thirdTrack)
+        modelContext.insert(thirdApp)
+        modelContext.insert(thirdTrack)
+        try modelContext.save()
+
+        let provider = SteppingRankingProvider(pages: [
+            QueryRankingProvider.key(term: "alpha keyword", storefront: "us", platform: .iphone): SearchRankingPage(
+                items: [rankingItem(position: 1, appStoreID: firstApp.appStoreID, platform: .iphone)],
+                source: .iTunesFallback
+            ),
+            QueryRankingProvider.key(term: "bravo keyword", storefront: "us", platform: .iphone): SearchRankingPage(
+                items: [rankingItem(position: 1, appStoreID: secondApp.appStoreID, platform: .iphone)],
+                source: .iTunesFallback
+            ),
+            QueryRankingProvider.key(term: "charlie keyword", storefront: "us", platform: .iphone): SearchRankingPage(
+                items: [rankingItem(position: 1, appStoreID: thirdApp.appStoreID, platform: .iphone)],
+                source: .iTunesFallback
+            ),
+        ])
+        let coordinator = RankingRefreshCoordinator(
+            rankingProvider: provider,
+            appCatalogService: AppCatalogService(appResolver: StubAppResolver())
+        )
+        let progressRecorder = RankingRefreshProgressRecorder()
+
+        let refreshTask = Task { @MainActor in
+            await coordinator.refresh(
+                tracks: [firstTrack, secondTrack, thirdTrack],
+                in: modelContext,
+                progress: { completed, total, failureCount in
+                    await progressRecorder.record(completed: completed, total: total, failureCount: failureCount)
+                }
+            )
+        }
+
+        // Let the coordinator dispatch the first group's provider call, then
+        // cancel while it is still in flight (mirroring Stop being tapped
+        // mid-refresh), and only then let that in-flight call resolve.
+        await provider.waitUntilFirstCallStarted()
+        refreshTask.cancel()
+        await provider.releaseFirstCall()
+
+        let outcomes = await refreshTask.value
+
+        // Dispatch stopped: only the group already in flight when Stop was
+        // pressed was ever sent to the provider. The other two groups never
+        // got dispatched.
+        #expect(await provider.callCount == 1)
+
+        // The group that was in flight at the moment of cancellation comes
+        // back untouched -- neither persisted nor marked failed -- exactly
+        // like the two groups that never got dispatched. `fetchRankingPage`
+        // re-checks cancellation after the provider await and `refreshPage`
+        // maps that `CancellationError` into a `.failure`, so the loop's
+        // post-fetch `Task.isCancelled` break is what keeps a stopped run from
+        // reading as an error. Without that break this group would produce a
+        // failed outcome, a "Ranking failed to refresh. ... CancellationError"
+        // status row, and a failure progress tick.
+        #expect(outcomes.isEmpty)
+
+        let snapshots = try modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>())
+        #expect(snapshots.isEmpty)
+
+        let crawls = try modelContext.fetch(FetchDescriptor<KeywordRankingCrawl>())
+        #expect(crawls.isEmpty)
+
+        // No track -- including the one in flight when Stop was pressed --
+        // should be marked failed by a user-initiated stop.
+        let statuses = try modelContext.fetch(FetchDescriptor<TrackedKeywordRefreshStatus>())
+        #expect(statuses.isEmpty)
+
+        let progressValues = await progressRecorder.values()
+        #expect(progressValues.last == RankingRefreshProgressValue(completed: 0, total: 3, failureCount: 0))
+    }
+
+    @Test
+    func freshRefreshAfterCancelledRunCompletesNormally() async throws {
+        let container = try makeInMemoryContainer()
+        let modelContext = ModelContext(container)
+        modelContext.autosaveEnabled = false
+
+        let app = TrackedApp(
+            appStoreID: 601,
+            bundleID: "example.resume.601",
+            name: "Resume App",
+            sellerName: "Example",
+            defaultPlatform: .iphone
+        )
+        let firstTrack = try makeTrackedAppKeyword(term: "delta keyword", trackedApp: app, in: modelContext)
+        let secondTrack = try makeTrackedAppKeyword(term: "echo keyword", trackedApp: app, in: modelContext)
+        app.keywordTracks.append(contentsOf: [firstTrack, secondTrack])
+        modelContext.insert(app)
+        modelContext.insert(firstTrack)
+        modelContext.insert(secondTrack)
+        try modelContext.save()
+
+        let provider = SteppingRankingProvider(pages: [
+            QueryRankingProvider.key(term: "delta keyword", storefront: "us", platform: .iphone): SearchRankingPage(
+                items: [rankingItem(position: 1, appStoreID: app.appStoreID, platform: .iphone)],
+                source: .iTunesFallback
+            ),
+            QueryRankingProvider.key(term: "echo keyword", storefront: "us", platform: .iphone): SearchRankingPage(
+                items: [rankingItem(position: 2, appStoreID: app.appStoreID, platform: .iphone)],
+                source: .iTunesFallback
+            ),
+        ])
+        let coordinator = RankingRefreshCoordinator(
+            rankingProvider: provider,
+            appCatalogService: AppCatalogService(appResolver: StubAppResolver())
+        )
+
+        // First run: cancel it after the first group is dispatched, same as
+        // the mid-run cancellation scenario above.
+        let cancelledTask = Task { @MainActor in
+            await coordinator.refresh(tracks: [firstTrack, secondTrack], in: modelContext)
+        }
+        await provider.waitUntilFirstCallStarted()
+        cancelledTask.cancel()
+        await provider.releaseFirstCall()
+        // Same contract as
+        // cancellingMidRunStopsDispatchAndLeavesRemainingTracksUntouched():
+        // a stopped run reports nothing, including for the group that was in
+        // flight when cancellation arrived.
+        let cancelledOutcomes = await cancelledTask.value
+        #expect(cancelledOutcomes.isEmpty)
+
+        // Second run against the same coordinator/provider/context: nothing
+        // about the earlier stop should prevent a normal, uncancelled refresh
+        // from completing in full.
+        let freshOutcomes = await coordinator.refresh(tracks: [firstTrack, secondTrack], in: modelContext)
+
+        #expect(freshOutcomes.count == 2)
+        #expect(freshOutcomes.allSatisfy { $0.error == nil })
+        #expect(await provider.callCount == 3)
+
+        let snapshots = try modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>())
+        #expect(snapshots.first(where: { $0.trackIdentityKey == firstTrack.identityKey })?.rank == 1)
+        #expect(snapshots.first(where: { $0.trackIdentityKey == secondTrack.identityKey })?.rank == 2)
+
+        // A fresh, uncancelled success always writes a resolved (nil-message)
+        // status marker -- see TrackedKeywordRefreshStatusStore.set's success
+        // call site in persistRankingPage. That's independent of this test's
+        // concern (a prior stop must not block a later refresh from
+        // completing), so assert "no failure message survives", not "no
+        // status rows exist".
+        let statuses = try modelContext.fetch(FetchDescriptor<TrackedKeywordRefreshStatus>())
+        #expect(statuses.allSatisfy { $0.message == nil })
+    }
 }
 
 private actor RankingMetadataEnrichmentRequestRecorder {
@@ -2132,6 +2326,131 @@ struct AppDetailRefreshServiceQueueTests {
         let summaries = await recorder.completedSummaries()
         #expect(summaries.map(\.result) == [.failure, .success])
         #expect(summaries.allSatisfy { !$0.observedCancellation })
+    }
+
+    /// The path the Stop button actually exercises: a manual keyword refresh
+    /// cancelled while a ranking fetch is in flight. `AppDetailRefreshService`
+    /// re-checks cancellation after the provider await, so the interrupted
+    /// group must never reach `recordRefreshFailure` -- a stopped run leaves no
+    /// snapshot, no crawl, and no `TrackedKeywordRefreshStatus` row behind, and
+    /// releases the queue permit and progress state.
+    @Test
+    func cancellingKeywordRefreshLeavesNoRankingSnapshotsOrFailureStatuses() async throws {
+        let container = try makeInMemoryContainer()
+        let modelContext = ModelContext(container)
+        let trackedApp = TrackedApp(
+            appStoreID: 900,
+            bundleID: "example.stop.900",
+            name: "Stoppable",
+            sellerName: "Example",
+            defaultPlatform: .iphone
+        )
+        let track = try makeTrackedAppKeyword(
+            term: "stoppable keyword",
+            trackedApp: trackedApp,
+            in: modelContext
+        )
+        trackedApp.keywordTracks.append(track)
+        modelContext.insert(trackedApp)
+        modelContext.insert(track)
+        try modelContext.save()
+
+        let backgroundModelStore = BackgroundModelStore(modelContainer: container)
+        let baseline = try await backgroundModelStore.read { modelContext in
+            try rankingPersistenceState(in: modelContext)
+        }
+        #expect(baseline.statusCount == 0)
+
+        let provider = GatedRankingProvider()
+        let progressStore = AppRefreshProgressStore()
+        let httpClient = MockHTTPClient { request in
+            throw OpenASOError.providerUnavailable(
+                "Unexpected request to \(request.url?.absoluteString ?? "unknown URL")"
+            )
+        }
+        let defaults = makeDefaults()
+        let keychain = InMemoryKeychainService()
+        let service = AppDetailRefreshService(
+            backgroundModelStore: backgroundModelStore,
+            refreshCoordinator: RankingRefreshCoordinator(
+                rankingProvider: provider,
+                appCatalogService: AppCatalogService(appResolver: StubAppResolver())
+            ),
+            keywordMetricsService: KeywordMetricsService(
+                httpClient: httpClient,
+                credentialStore: AppleAdsCredentialStore(
+                    defaults: defaults,
+                    keychain: keychain,
+                    loadsEnvironmentCredentials: false
+                ),
+                settingsStore: AppSettingsStore(defaults: defaults),
+                webSessionStore: AppleAdsWebSessionStore(defaults: defaults, keychain: keychain)
+            ),
+            appStorefrontRatingService: AppStorefrontRatingService(httpClient: httpClient),
+            appStorefrontReviewService: AppStorefrontReviewService(httpClient: httpClient),
+            appStoreConnectReviewService: AppStoreConnectReviewService(
+                httpClient: httpClient,
+                credentialStore: AppStoreConnectCredentialStore(defaults: defaults, keychain: keychain)
+            ),
+            progressStore: progressStore
+        )
+
+        let refreshTask = Task {
+            await service.refresh(AppDetailRefreshRequest(
+                app: AppDetailRefreshAppSnapshot(
+                    appStoreID: trackedApp.appStoreID,
+                    bundleID: trackedApp.bundleID,
+                    name: trackedApp.name,
+                    subtitle: trackedApp.subtitle,
+                    sellerName: trackedApp.sellerName,
+                    defaultPlatform: trackedApp.defaultPlatform
+                ),
+                workspace: .keywords,
+                storefrontSelection: .storefront(code: "us"),
+                trackIdentityKeys: [track.identityKey],
+                trigger: "manual",
+                refreshKeywords: true,
+                refreshMetrics: false,
+                refreshRatings: false,
+                refreshReviews: false,
+                recordsRatingsReviewsRefresh: false,
+                popularityContextAppStoreID: nil,
+                appleAdsWebSession: nil,
+                appStoreConnectCredentials: AppStoreConnectCredentials(
+                    issuerID: "",
+                    keyID: "",
+                    privateKey: ""
+                )
+            ))
+        }
+
+        // Cancel while the provider call is still in flight, then let it
+        // answer -- the exact ordering of tapping Stop mid-refresh. The page
+        // the provider returns must be discarded rather than persisted.
+        await provider.waitUntilStarted()
+        refreshTask.cancel()
+        await provider.succeed(SearchRankingPage(
+            items: [rankingItem(position: 1, appStoreID: trackedApp.appStoreID, platform: .iphone)],
+            source: .iTunesFallback
+        ))
+
+        let result = await refreshTask.value
+        #expect(result.wasCancelled)
+        #expect(result.keywordOutcomes.isEmpty)
+        #expect(result.firstError == nil)
+
+        let state = try await backgroundModelStore.read { modelContext in
+            try rankingPersistenceState(in: modelContext)
+        }
+        #expect(state.statusCount == 0)
+        #expect(state.snapshotCount == baseline.snapshotCount)
+        #expect(state.crawlCount == baseline.crawlCount)
+        #expect(state.observationItemCount == baseline.observationItemCount)
+        #expect(state.rankedResultCount == baseline.rankedResultCount)
+        #expect(state.trackStates == baseline.trackStates)
+
+        #expect(progressStore.activeRefresh == nil)
+        #expect(progressStore.pendingAppRefreshCount == 0)
     }
 
     private static func request(appStoreID: Int64) -> AppDetailRefreshRequest {
@@ -2871,6 +3190,70 @@ private actor GatedRankingProvider: SearchRankingProvider {
         }
         self.continuation = nil
         continuation.resume(returning: page)
+    }
+}
+
+/// Answers every call from a fixed `[queryKey: page]` table, but suspends the
+/// very first call until the test explicitly releases it. Used to make Stop
+/// cancellation deterministic: the test waits for the first provider call to
+/// start, cancels the refresh task while it is in flight, then releases the
+/// call and observes that no further groups were ever dispatched.
+private actor SteppingRankingProvider: SearchRankingProvider {
+    private let pages: [String: SearchRankingPage]
+    private(set) var callCount = 0
+    private var firstCallContinuation: CheckedContinuation<Void, Never>?
+    private var firstCallStarted = false
+    private var firstCallReleased = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(pages: [String: SearchRankingPage]) {
+        self.pages = pages
+    }
+
+    func search(
+        keyword: String,
+        storefrontCode: String,
+        platform: AppPlatform,
+        limit: Int
+    ) async throws -> SearchRankingPage {
+        callCount += 1
+        if callCount == 1 {
+            firstCallStarted = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+            // `firstCallReleased` makes the handshake order-independent: if a
+            // future change lets the release land before the first call
+            // suspends, the call proceeds instead of hanging until the suite's
+            // time limit fires.
+            if !firstCallReleased {
+                await withCheckedContinuation { continuation in
+                    self.firstCallContinuation = continuation
+                }
+            }
+        }
+
+        let queryKey = QueryRankingProvider.key(term: keyword, storefront: storefrontCode, platform: platform)
+        guard let page = pages[queryKey] else {
+            throw OpenASOError.unexpectedResponse
+        }
+        return page
+    }
+
+    func waitUntilFirstCallStarted() async {
+        guard !firstCallStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseFirstCall() {
+        firstCallReleased = true
+        guard let firstCallContinuation else { return }
+        self.firstCallContinuation = nil
+        firstCallContinuation.resume()
     }
 }
 
