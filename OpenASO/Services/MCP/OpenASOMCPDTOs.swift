@@ -42,18 +42,58 @@ struct OpenASOMCPErrorDTO: Codable, Sendable, Equatable {
 }
 
 struct OpenASOMCPMutationSummary: Codable, Sendable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case inserted
+        case updated
+        case skipped
+        case refreshed
+        case failed
+        case removed
+    }
+
     var inserted: Int
     var updated: Int
     var skipped: Int
     var refreshed: Int
     var failed: Int
+    var removed: Int
+
+    init(
+        inserted: Int,
+        updated: Int,
+        skipped: Int,
+        refreshed: Int,
+        failed: Int,
+        removed: Int = 0
+    ) {
+        self.inserted = inserted
+        self.updated = updated
+        self.skipped = skipped
+        self.refreshed = refreshed
+        self.failed = failed
+        self.removed = removed
+    }
+
+    /// `removed` arrived after the other counters, so it decodes leniently:
+    /// the synthesized `init(from:)` would ignore a stored-property default
+    /// and reject every payload written before `remove_keywords` shipped.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        inserted = try container.decode(Int.self, forKey: .inserted)
+        updated = try container.decode(Int.self, forKey: .updated)
+        skipped = try container.decode(Int.self, forKey: .skipped)
+        refreshed = try container.decode(Int.self, forKey: .refreshed)
+        failed = try container.decode(Int.self, forKey: .failed)
+        removed = try container.decodeIfPresent(Int.self, forKey: .removed) ?? 0
+    }
 
     static let empty = OpenASOMCPMutationSummary(
         inserted: 0,
         updated: 0,
         skipped: 0,
         refreshed: 0,
-        failed: 0
+        failed: 0,
+        removed: 0
     )
 }
 

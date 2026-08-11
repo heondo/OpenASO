@@ -2038,6 +2038,30 @@ struct OpenASOMCPServiceTests {
     }
 
     @Test
+    func mutationSummaryDecodesPayloadsWithoutRemovedAndEncodesIt() throws {
+        let legacyPayload = Data("""
+        {"inserted":1,"updated":2,"skipped":3,"refreshed":4,"failed":5}
+        """.utf8)
+
+        let decoded = try JSONDecoder().decode(OpenASOMCPMutationSummary.self, from: legacyPayload)
+        #expect(decoded == OpenASOMCPMutationSummary(
+            inserted: 1,
+            updated: 2,
+            skipped: 3,
+            refreshed: 4,
+            failed: 5,
+            removed: 0
+        ))
+
+        let reencoded = try JSONEncoder().encode(
+            OpenASOMCPMutationSummary(inserted: 0, updated: 0, skipped: 1, refreshed: 0, failed: 0, removed: 2)
+        )
+        let object = try #require(JSONSerialization.jsonObject(with: reencoded) as? [String: Any])
+        #expect(object["removed"] as? Int == 2)
+        #expect(try JSONDecoder().decode(OpenASOMCPMutationSummary.self, from: reencoded).removed == 2)
+    }
+
+    @Test
     func refreshKeywordRankingsIsIdempotentAndPrunesStaleTopResults() async throws {
         let rankingProvider = StubMCPRankingProvider(pages: [
             "calorie tracker::us::iphone": SearchRankingPage(items: [
