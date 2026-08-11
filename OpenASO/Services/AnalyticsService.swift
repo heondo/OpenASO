@@ -68,6 +68,7 @@ final class AppSettingsStore {
     static let lastRatingsReviewsRefreshAt = "dailyRefresh.lastRatingsReviewsRefreshAt"
     static let lastBackgroundRefreshRun = "dailyRefresh.lastBackgroundRefreshRun"
     static let mcpServerPort = "mcp.serverPort"
+    static let mcpServerAutostart = "mcp.serverAutostart"
   }
 
   static let defaultIsAnalyticsEnabled = true
@@ -86,6 +87,7 @@ final class AppSettingsStore {
   private(set) var lastRatingsReviewsRefreshAt: Date?
   private(set) var lastBackgroundRefreshRun: BackgroundRefreshRunRecord?
   private(set) var mcpServerPort: Int
+  private(set) var mcpServerAutostart: Bool
   var requestedSettingsFocusSection: AppleAdsSettingsFocusSection?
 
   init(defaults: UserDefaults = .openASOShared) {
@@ -133,6 +135,7 @@ final class AppSettingsStore {
       defaults.object(forKey: DefaultsKey.lastRatingsReviewsRefreshAt) as? Date
     self.lastBackgroundRefreshRun = Self.loadBackgroundRefreshRun(from: defaults)
     self.mcpServerPort = Self.normalizedMCPServerPort(storedMCPServerPort)
+    self.mcpServerAutostart = defaults.bool(forKey: DefaultsKey.mcpServerAutostart)
     self.requestedSettingsFocusSection = nil
   }
 
@@ -326,6 +329,13 @@ final class AppSettingsStore {
     let normalizedPort = Self.normalizedMCPServerPort(port)
     defaults.set(normalizedPort, forKey: DefaultsKey.mcpServerPort)
     mcpServerPort = normalizedPort
+  }
+
+  /// Remembers the user's last explicit MCP server start/stop so the server
+  /// comes back automatically on the next app launch.
+  func saveMCPServerAutostart(_ isEnabled: Bool) {
+    defaults.set(isEnabled, forKey: DefaultsKey.mcpServerAutostart)
+    mcpServerAutostart = isEnabled
   }
 
   private static func normalized(minutes: Int) -> Int {

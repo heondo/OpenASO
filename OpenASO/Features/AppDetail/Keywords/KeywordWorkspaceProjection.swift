@@ -12,11 +12,33 @@ enum KeywordWorkspaceProjection {
         let storefrontFilterID: String
         let platformFilterID: String
         let dateRangeID: String
+        let tagsFingerprint: Int
         let tracks: [TrackIdentity]
 
+        init(
+            refreshToken: Int,
+            backgroundStoreRevision: Int,
+            appStoreID: Int64,
+            storefrontFilterID: String,
+            platformFilterID: String,
+            dateRangeID: String,
+            tagsFingerprint: Int = 0,
+            tracks: [TrackIdentity]
+        ) {
+            self.refreshToken = refreshToken
+            self.backgroundStoreRevision = backgroundStoreRevision
+            self.appStoreID = appStoreID
+            self.storefrontFilterID = storefrontFilterID
+            self.platformFilterID = platformFilterID
+            self.dateRangeID = dateRangeID
+            self.tagsFingerprint = tagsFingerprint
+            self.tracks = tracks
+        }
+
         func hasSameVisibleWorkspace(as other: Self) -> Bool {
-            // Refresh tokens request newer persisted values; they do not change
-            // which already-hydrated rows are safe to keep visible meanwhile.
+            // Refresh tokens and tag fingerprints request newer values; they
+            // do not change which already-hydrated rows are safe to keep
+            // visible meanwhile.
             appStoreID == other.appStoreID
                 && storefrontFilterID == other.storefrontFilterID
                 && platformFilterID == other.platformFilterID
@@ -32,6 +54,25 @@ enum KeywordWorkspaceProjection {
         let positionRange: ClosedRange<Double>
         let changeRange: ClosedRange<Double>
         let showsOnlyChangedKeywords: Bool
+        let tagSelection: Set<String>
+
+        init(
+            searchText: String,
+            popularityRange: ClosedRange<Double>,
+            difficultyRange: ClosedRange<Double>,
+            positionRange: ClosedRange<Double>,
+            changeRange: ClosedRange<Double>,
+            showsOnlyChangedKeywords: Bool,
+            tagSelection: Set<String> = []
+        ) {
+            self.searchText = searchText
+            self.popularityRange = popularityRange
+            self.difficultyRange = difficultyRange
+            self.positionRange = positionRange
+            self.changeRange = changeRange
+            self.showsOnlyChangedKeywords = showsOnlyChangedKeywords
+            self.tagSelection = Set(tagSelection.map { $0.lowercased() })
+        }
     }
 
     struct FilterID: Hashable, Sendable {
@@ -72,10 +113,11 @@ enum KeywordWorkspaceProjection {
         return rows.filter { row in
             matchesSearch(row, searchText: searchText)
                 && matches(row.metrics?.popularityScore, in: filters.popularityRange, configuration: .popularity)
-                && matches(row.metrics?.difficultyScore, in: filters.difficultyRange, configuration: .difficulty)
+                && matches(row.displayDifficultyScore, in: filters.difficultyRange, configuration: .difficulty)
                 && matches(row.currentRank, in: filters.positionRange, configuration: .position)
                 && matches(row.trendDelta, in: filters.changeRange, configuration: .change)
                 && (!filters.showsOnlyChangedKeywords || row.trendDelta.map { $0 != 0 } == true)
+                && matchesTags(row, selection: filters.tagSelection)
         }
     }
 
@@ -92,6 +134,13 @@ enum KeywordWorkspaceProjection {
 
     private static func matchesSearch(_ row: KeywordWorkspaceRow, searchText: String) -> Bool {
         searchText.isEmpty || row.track.term.localizedStandardContains(searchText)
+    }
+
+    private static func matchesTags(
+        _ row: KeywordWorkspaceRow,
+        selection: Set<String>
+    ) -> Bool {
+        selection.isEmpty || row.track.tags.contains { selection.contains($0.lowercased()) }
     }
 
     private static func matches(

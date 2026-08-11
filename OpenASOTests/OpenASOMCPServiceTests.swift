@@ -83,6 +83,181 @@ struct OpenASOMCPServiceTests {
     }
 
     @Test
+    func updateKeywordTagsSetsReplacesAndClears() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        let set = try await service.updateKeywordTags(
+            appStoreID: 123,
+            keyword: "pomodoro",
+            storefront: "US",
+            platform: "iphone",
+            tags: [" v2.0.2 ", "brand", "V2.0.2"]
+        )
+        #expect(set.summary.updated == 1)
+        #expect(set.track.tags == ["v2.0.2", "brand"])
+
+        let listed = try await service.listKeywords(appStoreID: 123)
+        #expect(listed.items.first?.tags == ["v2.0.2", "brand"])
+
+        let replaced = try await service.updateKeywordTags(
+            appStoreID: 123,
+            keyword: "pomodoro",
+            storefront: "us",
+            platform: "iphone",
+            tags: ["v3.0-3.1"]
+        )
+        #expect(replaced.track.tags == ["v3.0-3.1"])
+
+        let cleared = try await service.updateKeywordTags(
+            appStoreID: 123,
+            keyword: "pomodoro",
+            storefront: "us",
+            platform: "iphone",
+            tags: []
+        )
+        #expect(cleared.track.tags.isEmpty)
+        let relisted = try await service.listKeywords(appStoreID: 123)
+        #expect(relisted.items.first?.tags == [])
+    }
+
+    @Test
+    func updateKeywordTagsRejectsInvalidInput() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        await #expect(throws: (any Error).self) {
+            _ = try await service.updateKeywordTags(
+                appStoreID: 123,
+                keyword: "pomodoro",
+                storefront: "us",
+                platform: "iphone",
+                tags: ["a,b"]
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await service.updateKeywordTags(
+                appStoreID: 123,
+                keyword: "pomodoro",
+                storefront: "us",
+                platform: "iphone",
+                tags: [String(repeating: "x", count: 61)]
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await service.updateKeywordTags(
+                appStoreID: 123,
+                keyword: "pomodoro",
+                storefront: "us",
+                platform: "iphone",
+                tags: (1...21).map { "tag-\($0)" }
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await service.updateKeywordTags(
+                appStoreID: 123,
+                keyword: "not tracked",
+                storefront: "us",
+                platform: "iphone",
+                tags: ["brand"]
+            )
+        }
+
+        let listed = try await service.listKeywords(appStoreID: 123)
+        #expect(listed.items.first?.tags == [])
+    }
+
+    @Test
+    func listKeywordsCarriesEstimatedDifficultyAndEffectivePrecedence() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro", "habit tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        // "pomodoro" gets an imported difficulty plus a native estimate; the
+        // estimate must win the effective value. "habit tracker" stays bare.
+        let queryKey = KeywordQuery.makeQueryKey(term: "pomodoro", storefront: "us", platform: .iphone)
+        context.modelContext.insert(KeywordDailyMetric(
+            queryKey: queryKey,
+            keyword: "pomodoro",
+            storefront: "us",
+            platform: .iphone,
+            popularityScore: 40,
+            difficultyScore: 12,
+            source: .appleAdsPopularity
+        ))
+        let fetchedAt = isoDate("2026-05-06T12:00:00Z")
+        let estimation = KeywordDifficultyEstimator.estimate(
+            keyword: "pomodoro",
+            searchResults: (1...5).map { position in
+                SearchRankingItem(
+                    position: position,
+                    appStoreID: Int64(position),
+                    bundleID: nil,
+                    name: "Pomodoro \(position)",
+                    subtitle: "Pomodoro focus timer",
+                    sellerName: nil,
+                    ratingCount: 9_000
+                )
+            }
+        )
+        guard case .estimated = estimation else {
+            Issue.record("Expected a computable estimate for the fixture")
+            return
+        }
+        _ = try EstimatedKeywordDifficultyStore.upsert(
+            EstimatedKeywordDifficultyPayloadFactory.makePayload(
+                estimation: estimation,
+                queryKey: queryKey,
+                keyword: "pomodoro",
+                storefront: "us",
+                platform: .iphone,
+                requestedResultLimit: 200,
+                providerResultCount: 5,
+                rankingSource: .appStoreWeb,
+                rankingFetchedAt: fetchedAt,
+                computedAt: fetchedAt.addingTimeInterval(1),
+                fallbackContext: nil
+            ),
+            in: context.modelContext
+        )
+        try context.modelContext.save()
+
+        let listed = try await service.listKeywords(appStoreID: 123)
+        let pomodoro = try #require(listed.items.first { $0.keyword == "pomodoro" })
+        let habit = try #require(listed.items.first { $0.keyword == "habit tracker" })
+
+        #expect(pomodoro.difficultyScore == 12)
+        #expect(pomodoro.estimatedDifficultyScore != nil)
+        #expect(pomodoro.estimatedDifficultyConfidence != nil)
+        #expect(pomodoro.effectiveDifficultyScore == pomodoro.estimatedDifficultyScore)
+        #expect(pomodoro.estimatedDifficultyRankingFetchedAt == fetchedAt)
+
+        #expect(habit.difficultyScore == nil)
+        #expect(habit.estimatedDifficultyScore == nil)
+        #expect(habit.effectiveDifficultyScore == nil)
+    }
+
+    @Test
     func listReviewsFiltersAndPaginatesNewestFirst() async throws {
         let context = try MCPTestContext()
         let service = context.service

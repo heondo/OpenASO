@@ -58,6 +58,38 @@ enum OpenASOMCPValidation {
         }
     }
 
+    /// Unlike lenient CSV import, the MCP surface rejects invalid tags so an
+    /// automation agent learns about the problem instead of silently losing
+    /// data. An empty list is valid and clears the keyword's tags.
+    static func tags(_ values: [String]) throws -> [String] {
+        var uniqueLowercased = Set<String>()
+        var normalizedTags: [String] = []
+        for value in values {
+            guard !KeywordTagNormalization.containsDisallowedCharacters(value) else {
+                throw OpenASOError.providerUnavailable(
+                    "Tag \"\(value)\" contains a disallowed character. Commas, semicolons, and newlines cannot appear inside a tag."
+                )
+            }
+            guard let normalized = KeywordTagNormalization.normalizedTag(value) else {
+                throw OpenASOError.providerUnavailable("Tags must be non-empty.")
+            }
+            guard normalized.count <= KeywordTagNormalization.maxTagLength else {
+                throw OpenASOError.providerUnavailable(
+                    "Tag \"\(normalized)\" exceeds \(KeywordTagNormalization.maxTagLength) characters."
+                )
+            }
+            if uniqueLowercased.insert(normalized.lowercased()).inserted {
+                normalizedTags.append(normalized)
+            }
+        }
+        guard normalizedTags.count <= KeywordTagNormalization.maxTagsPerKeyword else {
+            throw OpenASOError.providerUnavailable(
+                "A keyword can have at most \(KeywordTagNormalization.maxTagsPerKeyword) tags."
+            )
+        }
+        return normalizedTags
+    }
+
     static func nonEmpty(
         _ value: String,
         fieldName: String,

@@ -6,7 +6,7 @@ import Testing
 @MainActor
 struct PersistenceMigrationTests {
     @Test
-    func migrationPlanAppendsThroughV5AndKeepsPriorSchemasFrozen() throws {
+    func migrationPlanAppendsThroughV6AndKeepsPriorSchemasFrozen() throws {
         let container = try ModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
 
         #expect(OpenASOSchemaV1.versionIdentifier == Schema.Version(1, 0, 0))
@@ -19,18 +19,21 @@ struct PersistenceMigrationTests {
         #expect(OpenASOSchemaV4.models.count == 21)
         #expect(OpenASOSchemaV5.versionIdentifier == Schema.Version(5, 0, 0))
         #expect(OpenASOSchemaV5.models.count == 23)
-        #expect(OpenASOMigrationPlan.currentSchema.versionIdentifier == Schema.Version(5, 0, 0))
-        #expect(OpenASOMigrationPlan.schemas.count == 5)
+        #expect(OpenASOSchemaV6.versionIdentifier == Schema.Version(6, 0, 0))
+        #expect(OpenASOSchemaV6.models.count == 24)
+        #expect(OpenASOMigrationPlan.currentSchema.versionIdentifier == Schema.Version(6, 0, 0))
+        #expect(OpenASOMigrationPlan.schemas.count == 6)
         #expect(OpenASOMigrationPlan.schemas[0].versionIdentifier == OpenASOSchemaV1.versionIdentifier)
         #expect(OpenASOMigrationPlan.schemas[1].versionIdentifier == OpenASOSchemaV2.versionIdentifier)
         #expect(OpenASOMigrationPlan.schemas[2].versionIdentifier == OpenASOSchemaV3.versionIdentifier)
         #expect(OpenASOMigrationPlan.schemas[3].versionIdentifier == OpenASOSchemaV4.versionIdentifier)
         #expect(OpenASOMigrationPlan.schemas[4].versionIdentifier == OpenASOSchemaV5.versionIdentifier)
+        #expect(OpenASOMigrationPlan.schemas[5].versionIdentifier == OpenASOSchemaV6.versionIdentifier)
         #expect(
             OpenASOMigrationPlan.currentSchema.versionIdentifier
                 == OpenASOMigrationPlan.schemas.last?.versionIdentifier
         )
-        #expect(OpenASOMigrationPlan.stages.count == 4)
+        #expect(OpenASOMigrationPlan.stages.count == 5)
         #expect(container.migrationPlan != nil)
     }
 
@@ -60,6 +63,7 @@ struct PersistenceMigrationTests {
             ).isEmpty)
             #expect(try modelContext.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try modelContext.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try modelContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
             let migratedStatus = try #require(modelContext.fetch(
                 FetchDescriptor<TrackedKeywordRefreshStatus>()
             ).first)
@@ -111,6 +115,7 @@ struct PersistenceMigrationTests {
             ).isEmpty)
             #expect(try reopenedContext.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try reopenedContext.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try reopenedContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
         }
 
         try fixture.verifyBundledArtifacts()
@@ -155,6 +160,7 @@ struct PersistenceMigrationTests {
             ).isEmpty)
             #expect(try context.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try context.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try context.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
         }
     }
 
@@ -209,6 +215,7 @@ struct PersistenceMigrationTests {
             ).isEmpty)
             #expect(try context.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try context.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try context.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
         }
     }
 
@@ -229,6 +236,7 @@ struct PersistenceMigrationTests {
             try assertExactV4FixtureSentinels(in: modelContext)
             #expect(try modelContext.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try modelContext.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try modelContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
 
             let project = KeywordResearchProject(
                 id: ExactV4FixtureSentinel.projectID,
@@ -285,6 +293,89 @@ struct PersistenceMigrationTests {
         }
 
         try fixture.verifyBundledArtifacts()
+    }
+
+    @Test
+    func v5StoreMigratesToV6AndRoundTripsKeywordTags() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "OpenASO-V5-to-V6-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let storeURL = rootURL.appendingPathComponent("default.store", isDirectory: false)
+
+        let keyword = "v5::tags migration"
+        let storefront = "us"
+        let platform = AppPlatform.iphone
+        var trackIdentityKey = ""
+
+        try autoreleasepool {
+            let schema = Schema(versionedSchema: OpenASOSchemaV5.self)
+            let configuration = ModelConfiguration(schema: schema, url: storeURL)
+            let container = try ModelContainer(for: schema, configurations: [configuration])
+            let context = ModelContext(container)
+            let trackedApp = TrackedApp(
+                appStoreID: 320_000_064,
+                bundleID: "com.example.v5-tags",
+                name: "V5 Tags",
+                sellerName: "Example",
+                defaultPlatform: platform
+            )
+            let query = KeywordQuery(
+                term: keyword,
+                storefront: storefront,
+                platform: platform
+            )
+            let track = TrackedAppKeyword(
+                term: keyword,
+                storefront: storefront,
+                platform: platform,
+                trackedApp: trackedApp,
+                query: query
+            )
+            trackIdentityKey = track.identityKey
+            trackedApp.keywordTracks.append(track)
+            context.insert(trackedApp)
+            context.insert(query)
+            context.insert(track)
+            try context.save()
+        }
+
+        try autoreleasepool {
+            let container = try ModelContainerFactory.makePersistentModelContainer(at: storeURL)
+            let context = ModelContext(container)
+            #expect(try context.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
+
+            let track = try #require(context.fetch(
+                FetchDescriptor<TrackedAppKeyword>()
+            ).first)
+            #expect(track.identityKey == trackIdentityKey)
+            let applied = try TrackedKeywordTagStore.setTags(
+                ["v2.0.2", "v3.0-3.1", "Brand"],
+                for: track,
+                in: context
+            )
+            #expect(applied == ["v2.0.2", "v3.0-3.1", "Brand"])
+            try context.save()
+        }
+
+        try autoreleasepool {
+            let container = try ModelContainerFactory.makePersistentModelContainer(at: storeURL)
+            let context = ModelContext(container)
+            let track = try #require(context.fetch(
+                FetchDescriptor<TrackedAppKeyword>()
+            ).first)
+            #expect(
+                try TrackedKeywordTagStore.tags(for: track, in: context)
+                    == ["v2.0.2", "v3.0-3.1", "Brand"]
+            )
+            let record = try #require(context.fetch(
+                FetchDescriptor<TrackedKeywordTagRecord>()
+            ).first)
+            #expect(record.trackIdentityKey == trackIdentityKey)
+            #expect(record.appStoreID == 320_000_064)
+        }
     }
 
     @Test
@@ -458,6 +549,7 @@ struct PersistenceMigrationTests {
             )
             #expect(try context.fetch(FetchDescriptor<KeywordResearchProject>()).isEmpty)
             #expect(try context.fetch(FetchDescriptor<KeywordResearchKeyword>()).isEmpty)
+            #expect(try context.fetch(FetchDescriptor<TrackedKeywordTagRecord>()).isEmpty)
 
             let project = KeywordResearchProject(
                 id: projectID,

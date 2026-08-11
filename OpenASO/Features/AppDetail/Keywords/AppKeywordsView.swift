@@ -6,6 +6,7 @@ struct AppKeywordsView: View {
     @Environment(AppServices.self) private var services
 
     @Query private var tracks: [TrackedAppKeyword]
+    @Query private var tagRecords: [TrackedKeywordTagRecord]
 
     let trackedApp: TrackedApp
     let searchText: String
@@ -17,6 +18,7 @@ struct AppKeywordsView: View {
     let positionFilterRange: ClosedRange<Double>
     let changeFilterRange: ClosedRange<Double>
     let showsOnlyChangedKeywords: Bool
+    let tagSelection: Set<String>
     let refreshToken: Int
     let reportError: (String) -> Void
 
@@ -33,6 +35,7 @@ struct AppKeywordsView: View {
         positionFilterRange: ClosedRange<Double>,
         changeFilterRange: ClosedRange<Double>,
         showsOnlyChangedKeywords: Bool,
+        tagSelection: Set<String>,
         refreshToken: Int,
         reportError: @escaping (String) -> Void
     ) {
@@ -46,10 +49,17 @@ struct AppKeywordsView: View {
         self.positionFilterRange = positionFilterRange
         self.changeFilterRange = changeFilterRange
         self.showsOnlyChangedKeywords = showsOnlyChangedKeywords
+        self.tagSelection = tagSelection
         self.refreshToken = refreshToken
         self.reportError = reportError
 
         let appStoreID = trackedApp.appStoreID
+        _tagRecords = Query(
+            filter: #Predicate<TrackedKeywordTagRecord> { record in
+                record.appStoreID == appStoreID
+            },
+            sort: [SortDescriptor(\TrackedKeywordTagRecord.trackIdentityKey, order: .forward)]
+        )
         let sortBy = [
             SortDescriptor(\TrackedAppKeyword.term, order: .forward),
             SortDescriptor(\TrackedAppKeyword.storefront, order: .forward),
@@ -77,6 +87,14 @@ struct AppKeywordsView: View {
     private func materializationID(
         tracks: [TrackedAppKeyword]
     ) -> KeywordWorkspaceProjection.MaterializationID {
+        // A tag edit changes no track identity, so it must refire the
+        // materialization task through the fingerprint to rebuild rows.
+        var tagsHasher = Hasher()
+        for record in tagRecords {
+            tagsHasher.combine(record.trackIdentityKey)
+            tagsHasher.combine(record.tags)
+            tagsHasher.combine(record.updatedAt)
+        }
         return KeywordWorkspaceProjection.MaterializationID(
             refreshToken: refreshToken,
             backgroundStoreRevision: services.backgroundModelStoreRevision,
@@ -84,6 +102,7 @@ struct AppKeywordsView: View {
             storefrontFilterID: selectedStorefrontFilter.id,
             platformFilterID: selectedPlatformFilter.id,
             dateRangeID: selectedDateRange.id,
+            tagsFingerprint: tagsHasher.finalize(),
             tracks: tracks.map { track in
                 KeywordWorkspaceProjection.MaterializationID.TrackIdentity(
                     identityKey: track.identityKey
@@ -99,7 +118,8 @@ struct AppKeywordsView: View {
             difficultyRange: difficultyFilterRange,
             positionRange: positionFilterRange,
             changeRange: changeFilterRange,
-            showsOnlyChangedKeywords: showsOnlyChangedKeywords
+            showsOnlyChangedKeywords: showsOnlyChangedKeywords,
+            tagSelection: tagSelection
         )
     }
 
@@ -121,6 +141,10 @@ struct AppKeywordsView: View {
     ) -> [KeywordWorkspaceRow] {
         var rows: [KeywordWorkspaceRow] = []
         rows.reserveCapacity(tracks.count)
+        let tagsByIdentityKey = TrackedKeywordTagStore.tagsByIdentityKey(
+            from: tagRecords,
+            for: tracks
+        )
 
         for track in tracks {
             let loadedRow = workspace?.rowsByIdentityKey[track.identityKey]
@@ -129,10 +153,12 @@ struct AppKeywordsView: View {
                     track: track,
                     storefront: storefrontLookup[track.storefront],
                     metrics: loadedRow?.metrics,
+                    estimatedDifficulty: loadedRow?.estimatedDifficulty,
                     refreshStatus: loadedRow?.refreshStatus ?? .empty,
                     latestSnapshot: loadedRow?.latestSnapshot,
                     trendSnapshots: loadedRow?.trendSnapshots ?? [],
-                    rankingApps: loadedRow?.rankingApps ?? []
+                    rankingApps: loadedRow?.rankingApps ?? [],
+                    tags: tagsByIdentityKey[track.identityKey] ?? []
                 )
             )
         }
@@ -341,6 +367,7 @@ private struct AppKeywordsPreviewHarness: View {
             positionFilterRange: MetricFilterRange.position.defaultRange,
             changeFilterRange: MetricFilterRange.change.defaultRange,
             showsOnlyChangedKeywords: false,
+            tagSelection: [],
             refreshToken: 0,
             reportError: { _ in }
         )

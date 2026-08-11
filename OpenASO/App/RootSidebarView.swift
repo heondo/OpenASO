@@ -620,6 +620,10 @@ struct RootSidebarView: View {
                 for: trackedKeywords.map(\.identityKey),
                 in: modelContext
             )
+            try TrackedKeywordTagStore.deleteTags(
+                for: trackedKeywords.map(\.identityKey),
+                in: modelContext
+            )
             for track in trackedKeywords {
                 modelContext.delete(track)
             }

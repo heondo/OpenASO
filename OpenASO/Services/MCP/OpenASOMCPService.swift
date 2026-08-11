@@ -991,12 +991,22 @@ final class OpenASOMCPService: Sendable {
         for: tracks.map(\.identityKey),
         in: modelContext
       )
+      let estimatedDifficultyByQueryKey = try EstimatedKeywordDifficultyStore.snapshots(
+        queryKeys: Array(Set(tracks.map(\.queryKey))),
+        in: modelContext
+      )
+      let tagsByIdentityKey = try TrackedKeywordTagStore.tagsByIdentityKey(
+        for: tracks,
+        in: modelContext
+      )
       let total = tracks.count
       let items = Array(tracks.dropFirst(page.offset).prefix(page.limit)).map {
         Self.keywordSummary(
           track: $0,
           metrics: metricsByQueryKey[$0.queryKey],
-          refreshStatus: refreshStatuses[$0.identityKey]
+          refreshStatus: refreshStatuses[$0.identityKey],
+          estimatedDifficulty: estimatedDifficultyByQueryKey[$0.queryKey],
+          tags: tagsByIdentityKey[$0.identityKey] ?? []
         )
       }
       return OpenASOMCPPage(
@@ -1515,7 +1525,69 @@ final class OpenASOMCPService: Sendable {
         track: Self.keywordSummary(
           track: track,
           metrics: metrics[track.queryKey],
-          refreshStatus: refreshStatus
+          refreshStatus: refreshStatus,
+          estimatedDifficulty: try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: track.queryKey,
+            in: modelContext
+          ),
+          tags: try TrackedKeywordTagStore.tags(for: track, in: modelContext)
+        ),
+        summary: OpenASOMCPMutationSummary(
+          inserted: 0,
+          updated: 1,
+          skipped: 0,
+          refreshed: 0,
+          failed: 0
+        )
+      )
+    }
+  }
+
+  func updateKeywordTags(
+    appStoreID: Int64,
+    keyword: String,
+    storefront: String,
+    platform: String?,
+    tags: [String]
+  ) async throws -> OpenASOMCPKeywordTagsResult {
+    let appStoreID = try OpenASOMCPValidation.appStoreID(appStoreID)
+    let keyword = try OpenASOMCPValidation.keyword(keyword)
+    let storefront = try OpenASOMCPValidation.storefront(storefront)
+    let platform = try OpenASOMCPValidation.platform(platform)
+    let tags = try OpenASOMCPValidation.tags(tags)
+    let identityKey = TrackedAppKeyword.makeIdentityKey(
+      appStoreID: appStoreID,
+      term: keyword,
+      storefront: storefront,
+      platform: platform
+    )
+
+    return try await backgroundModelStore.write { modelContext in
+      var descriptor = FetchDescriptor<TrackedAppKeyword>(
+        predicate: #Predicate { track in
+          track.identityKey == identityKey
+        }
+      )
+      descriptor.fetchLimit = 1
+      guard let track = try modelContext.fetch(descriptor).first else {
+        throw OpenASOError.appNotFound
+      }
+      let appliedTags = try TrackedKeywordTagStore.setTags(tags, for: track, in: modelContext)
+      let metrics = try Self.metricsByQueryKey(queryKeys: [track.queryKey], in: modelContext)
+      let refreshStatus = try TrackedKeywordRefreshStatusStore.snapshot(
+        for: track,
+        in: modelContext
+      )
+      return OpenASOMCPKeywordTagsResult(
+        track: Self.keywordSummary(
+          track: track,
+          metrics: metrics[track.queryKey],
+          refreshStatus: refreshStatus,
+          estimatedDifficulty: try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: track.queryKey,
+            in: modelContext
+          ),
+          tags: appliedTags
         ),
         summary: OpenASOMCPMutationSummary(
           inserted: 0,
@@ -2244,7 +2316,12 @@ final class OpenASOMCPService: Sendable {
                 track: Self.keywordSummary(
                   track: track,
                   metrics: metrics[track.queryKey],
-                  refreshStatus: refreshStatus
+                  refreshStatus: refreshStatus,
+                  estimatedDifficulty: try EstimatedKeywordDifficultyStore.snapshot(
+                    queryKey: track.queryKey,
+                    in: modelContext
+                  ),
+                  tags: try TrackedKeywordTagStore.tags(for: track, in: modelContext)
                 ),
                 rankingProvenance: Self.rankingProvenance(
                   request: item.request,
@@ -2274,7 +2351,12 @@ final class OpenASOMCPService: Sendable {
                 track: Self.keywordSummary(
                   track: track,
                   metrics: metrics[track.queryKey],
-                  refreshStatus: refreshStatus
+                  refreshStatus: refreshStatus,
+                  estimatedDifficulty: try EstimatedKeywordDifficultyStore.snapshot(
+                    queryKey: track.queryKey,
+                    in: modelContext
+                  ),
+                  tags: try TrackedKeywordTagStore.tags(for: track, in: modelContext)
                 ),
                 rankingProvenance: nil,
                 error: OpenASOMCPErrorDTO(error)
@@ -2404,6 +2486,14 @@ final class OpenASOMCPService: Sendable {
         for: tracks.map(\.identityKey),
         in: modelContext
       )
+      let estimatedDifficultyByQueryKey = try EstimatedKeywordDifficultyStore.snapshots(
+        queryKeys: Array(Set(tracks.map(\.queryKey))),
+        in: modelContext
+      )
+      let tagsByIdentityKey = try TrackedKeywordTagStore.tagsByIdentityKey(
+        for: tracks,
+        in: modelContext
+      )
       let outcomes = tracks.map { track in
         let metric = metrics[track.queryKey]
         let refreshStatus = TrackedKeywordRefreshStatusStore.snapshot(
@@ -2418,7 +2508,9 @@ final class OpenASOMCPService: Sendable {
           track: Self.keywordSummary(
             track: track,
             metrics: metric,
-            refreshStatus: refreshStatus
+            refreshStatus: refreshStatus,
+            estimatedDifficulty: estimatedDifficultyByQueryKey[track.queryKey],
+            tags: tagsByIdentityKey[track.identityKey] ?? []
           ),
           rankingProvenance: nil,
           error: error.map {
@@ -4346,7 +4438,9 @@ extension OpenASOMCPService {
   fileprivate static func keywordSummary(
     track: TrackedAppKeyword,
     metrics: KeywordDailyMetric?,
-    refreshStatus: KeywordRefreshStatusSnapshot? = nil
+    refreshStatus: KeywordRefreshStatusSnapshot? = nil,
+    estimatedDifficulty: EstimatedKeywordDifficultySnapshot? = nil,
+    tags: [String] = []
   )
     -> OpenASOMCPKeywordSummary
   {
@@ -4363,6 +4457,8 @@ extension OpenASOMCPService {
       for: track,
       persisted: refreshStatus
     )
+    let isEstimated = estimatedDifficulty?.state == .estimated
+    let estimatedScore = isEstimated ? estimatedDifficulty?.score : nil
     return OpenASOMCPKeywordSummary(
       id: track.identityKey,
       trackIdentityKey: track.identityKey,
@@ -4377,7 +4473,15 @@ extension OpenASOMCPService {
       resultCount: latest?.resultCount ?? track.rankingAppCount,
       popularityScore: metrics?.popularityScore,
       difficultyScore: metrics?.difficultyScore,
+      estimatedDifficultyScore: estimatedScore,
+      estimatedDifficultyConfidence: isEstimated ? estimatedDifficulty?.confidenceRaw : nil,
+      estimatedDifficultyConfidenceScore: isEstimated ? estimatedDifficulty?.confidenceScore : nil,
+      estimatedDifficultyUnavailableReason: isEstimated
+        ? nil : estimatedDifficulty?.unavailableReasonRaw,
+      estimatedDifficultyRankingFetchedAt: estimatedDifficulty?.rankingFetchedAt,
+      effectiveDifficultyScore: estimatedScore ?? metrics?.difficultyScore,
       notes: track.notes,
+      tags: tags,
       rankingStatusMessage: resolvedStatus.rankingMessage,
       popularityStatusMessage: resolvedStatus.popularityMessage,
       statusMessage: resolvedStatus.preferredMessage,

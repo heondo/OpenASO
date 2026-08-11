@@ -86,6 +86,7 @@ struct KeywordWorkspaceState {
     var positionFilterRange = MetricFilterRange.position.defaultRange
     var changeFilterRange = MetricFilterRange.change.defaultRange
     var showsOnlyChangedKeywords = false
+    var tagSelection: Set<String> = []
 
     mutating func resetFilters() {
         selectedPlatformFilter = .all
@@ -94,6 +95,7 @@ struct KeywordWorkspaceState {
         positionFilterRange = MetricFilterRange.position.defaultRange
         changeFilterRange = MetricFilterRange.change.defaultRange
         showsOnlyChangedKeywords = false
+        tagSelection = []
     }
 }
 

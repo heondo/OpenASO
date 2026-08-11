@@ -251,9 +251,18 @@ enum KeywordRankingListPreviewFixtures {
             track: track,
             storefront: storefrontDefinition,
             metrics: metrics,
+            estimatedDifficulty: EstimatedDifficultySummary(
+                score: 58,
+                confidenceScore: 88,
+                confidence: .high,
+                unavailableReason: nil,
+                rankingFetchedAt: .now,
+                computedAt: .now
+            ),
             latestSnapshot: snapshot,
             trendSnapshots: trendSnapshots,
-            rankingApps: snapshot.sortedTopResults
+            rankingApps: snapshot.sortedTopResults,
+            tags: ["v2.0.2", "brand", "v3.0-3.1"]
         )
         return (row, trackedApp.appStoreID)
     }

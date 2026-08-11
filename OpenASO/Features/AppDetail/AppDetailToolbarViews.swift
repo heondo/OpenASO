@@ -88,6 +88,7 @@ struct AppDetailStorefrontPickerButton: View {
 
 struct AppDetailFilterToolbarItems: View {
     @Binding var keywordWorkspaceState: KeywordWorkspaceState
+    let trackedAppStoreID: Int64
 
     var body: some View {
         AppDetailDateRangeToolbarMenu(selectedDateRange: $keywordWorkspaceState.selectedDateRange)
@@ -99,6 +100,8 @@ struct AppDetailFilterToolbarItems: View {
             positionFilterRange: $keywordWorkspaceState.positionFilterRange,
             changeFilterRange: $keywordWorkspaceState.changeFilterRange,
             showsOnlyChangedKeywords: $keywordWorkspaceState.showsOnlyChangedKeywords,
+            tagSelection: $keywordWorkspaceState.tagSelection,
+            trackedAppStoreID: trackedAppStoreID,
             resetFilters: {
                 keywordWorkspaceState.resetFilters()
             }
@@ -217,6 +220,8 @@ private struct AppDetailFilterButton: View {
     @Binding var positionFilterRange: ClosedRange<Double>
     @Binding var changeFilterRange: ClosedRange<Double>
     @Binding var showsOnlyChangedKeywords: Bool
+    @Binding var tagSelection: Set<String>
+    let trackedAppStoreID: Int64
 
     let resetFilters: () -> Void
     @State private var isShowingFilters = false
@@ -239,6 +244,8 @@ private struct AppDetailFilterButton: View {
                 positionFilterRange: $positionFilterRange,
                 changeFilterRange: $changeFilterRange,
                 showsOnlyChangedKeywords: $showsOnlyChangedKeywords,
+                tagSelection: $tagSelection,
+                trackedAppStoreID: trackedAppStoreID,
                 resetFilters: resetFilters
             )
         }
@@ -255,18 +262,25 @@ private struct AppDetailFilterButton: View {
             || !MetricFilterRange.position.isDefault(positionFilterRange)
             || !MetricFilterRange.change.isDefault(changeFilterRange)
             || showsOnlyChangedKeywords
+            || !tagSelection.isEmpty
     }
 }
 
 private struct AppDetailFilterPopover: View {
+    @Environment(\.modelContext) private var modelContext
+
     @Binding var selectedPlatformFilter: PlatformFilter
     @Binding var popularityFilterRange: ClosedRange<Double>
     @Binding var difficultyFilterRange: ClosedRange<Double>
     @Binding var positionFilterRange: ClosedRange<Double>
     @Binding var changeFilterRange: ClosedRange<Double>
     @Binding var showsOnlyChangedKeywords: Bool
+    @Binding var tagSelection: Set<String>
+    let trackedAppStoreID: Int64
 
     let resetFilters: () -> Void
+
+    @State private var availableTags: [String] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -294,6 +308,27 @@ private struct AppDetailFilterPopover: View {
             FilterRangeSlider(range: $changeFilterRange, configuration: .change)
             Divider()
 
+            if !availableTags.isEmpty {
+                Text("Tags")
+                    .font(.subheadline.weight(.semibold))
+                KeywordTagFlowLayout {
+                    ForEach(availableTags, id: \.self) { tag in
+                        Button {
+                            toggleTag(tag)
+                        } label: {
+                            KeywordTagChip(
+                                tag: tag,
+                                isSelected: tagSelection.contains(tag.lowercased())
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Filter by tag \(tag)")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+            }
+
             HStack {
                 Spacer()
                 Button("Reset", action: resetFilters)
@@ -303,6 +338,21 @@ private struct AppDetailFilterPopover: View {
         }
         .padding(16)
         .frame(width: 300)
+        .onAppear {
+            availableTags = (try? TrackedKeywordTagStore.distinctTags(
+                forAppStoreID: trackedAppStoreID,
+                in: modelContext
+            )) ?? []
+        }
+    }
+
+    private func toggleTag(_ tag: String) {
+        let key = tag.lowercased()
+        if tagSelection.contains(key) {
+            tagSelection.remove(key)
+        } else {
+            tagSelection.insert(key)
+        }
     }
 }
 

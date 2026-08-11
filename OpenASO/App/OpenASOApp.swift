@@ -94,6 +94,9 @@ struct OpenASOApp: App {
                             await services.backgroundRefreshAgentController.reconcile(
                                 isEnabled: services.settingsStore.isAutomaticRefreshEnabled
                             )
+                            if services.settingsStore.mcpServerAutostart {
+                                services.mcpServerController.start()
+                            }
                         }
                         services.analyticsService.capture(.appLaunched())
                         await services.prepareBackgroundModelStore()

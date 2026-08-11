@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Compute estimated keyword difficulty on every ranking refresh using the existing top10-authority-saturation heuristic, and show it in a new merged Difficulty column with confidence, staleness, and provenance indicators. Astro-imported values remain visible as a fallback until the next refresh.
+- Add free-form keyword tags with an editor sheet, autocomplete suggestions, a Tags table column, and tag filtering; tags survive copy-to-country and round-trip through the Astro-compatible CSV Tags column.
+- Expand MCP: list_keywords now returns estimated difficulty fields, an effectiveDifficultyScore, and tags; a new update_keyword_tags tool replaces a keyword's full tag list for automation.
+
 ## 0.4.2 - 2026-08-08
 
 OpenASO 0.4.2 adds reliable scheduled daily refreshes that can run while the app is closed and hardens headless MCP operation.

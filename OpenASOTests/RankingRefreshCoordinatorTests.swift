@@ -461,6 +461,179 @@ struct RankingRefreshCoordinatorTests {
     }
 
     @Test
+    func appliedRankingPagePersistsEstimatedDifficultyMatchingEstimator() throws {
+        let fixture = try makeEstimatedDifficultyFixture()
+        let items = (1...6).map { position in
+            ratedRankingItem(position: position, appStoreID: Int64(500 + position), ratingCount: 25_000)
+        }
+        let searchedAt = Date(timeIntervalSince1970: 1_900_000_000)
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: items,
+                searchedAt: searchedAt
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        let snapshot = try #require(try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: fixture.track.queryKey,
+            in: fixture.modelContext
+        ))
+        guard case .estimated(let expected) = KeywordDifficultyEstimator.estimate(
+            keyword: fixture.track.term,
+            searchResults: items
+        ) else {
+            Issue.record("Expected an estimated difficulty for the fixture page")
+            return
+        }
+        #expect(snapshot.state == .estimated)
+        #expect(snapshot.score == expected.score)
+        #expect(snapshot.confidenceScore == expected.confidenceScore)
+        #expect(snapshot.rankingFetchedAt == searchedAt)
+        #expect(snapshot.rankingSource == .appStoreWeb)
+        #expect(snapshot.fallbackCategory == nil)
+    }
+
+    @Test
+    func pageWithoutRatingEvidencePersistsUnavailableEstimate() throws {
+        let fixture = try makeEstimatedDifficultyFixture()
+        let items = (1...5).map { position in
+            rankingItem(position: position, appStoreID: Int64(500 + position), platform: .iphone)
+        }
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: items,
+                searchedAt: Date(timeIntervalSince1970: 1_900_000_000)
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        let snapshot = try #require(try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: fixture.track.queryKey,
+            in: fixture.modelContext
+        ))
+        #expect(snapshot.state == .unavailable)
+        #expect(snapshot.unavailableReason == .insufficientRatingEvidence)
+        #expect(snapshot.score == nil)
+    }
+
+    @Test
+    func olderPageReplayKeepsNewerEstimate() throws {
+        let fixture = try makeEstimatedDifficultyFixture()
+        let newerSearchedAt = Date(timeIntervalSince1970: 1_900_000_000)
+        let newerItems = (1...6).map { position in
+            ratedRankingItem(position: position, appStoreID: Int64(500 + position), ratingCount: 40_000)
+        }
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: newerItems,
+                searchedAt: newerSearchedAt
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: (1...6).map { position in
+                    ratedRankingItem(position: position, appStoreID: Int64(900 + position), ratingCount: 5)
+                },
+                searchedAt: newerSearchedAt.addingTimeInterval(-3_600)
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        let snapshot = try #require(try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: fixture.track.queryKey,
+            in: fixture.modelContext
+        ))
+        guard case .estimated(let expected) = KeywordDifficultyEstimator.estimate(
+            keyword: fixture.track.term,
+            searchResults: newerItems
+        ) else {
+            Issue.record("Expected an estimated difficulty for the newer fixture page")
+            return
+        }
+        #expect(snapshot.rankingFetchedAt == newerSearchedAt)
+        #expect(snapshot.score == expected.score)
+    }
+
+    @Test
+    func fallbackPagePreservesRealProvenanceThroughCanonicalization() throws {
+        let fixture = try makeEstimatedDifficultyFixture()
+        let items = (1...6).map { position in
+            ratedRankingItem(position: position, appStoreID: Int64(500 + position), ratingCount: 700)
+        }
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: items,
+                searchedAt: Date(timeIntervalSince1970: 1_900_000_000),
+                source: .iTunesFallback,
+                fallbackContext: SearchRankingFailureContext(
+                    provider: .appStoreWeb,
+                    category: .httpStatus(429)
+                )
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        let snapshot = try #require(try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: fixture.track.queryKey,
+            in: fixture.modelContext
+        ))
+        #expect(snapshot.rankingSource == .iTunesFallback)
+        #expect(snapshot.fallbackCategory == .httpStatus)
+        #expect(snapshot.fallbackHTTPStatus == 429)
+    }
+
+    @Test
+    func fallbackPageWithoutContextSynthesizesOtherProvenance() throws {
+        let fixture = try makeEstimatedDifficultyFixture()
+        let items = (1...6).map { position in
+            ratedRankingItem(position: position, appStoreID: Int64(500 + position), ratingCount: 700)
+        }
+
+        _ = try fixture.coordinator.persistRankingPageTransaction(
+            estimatedDifficultyPageResult(
+                track: fixture.track,
+                items: items,
+                searchedAt: Date(timeIntervalSince1970: 1_900_000_000),
+                source: .iTunesFallback
+            ),
+            in: fixture.modelContext,
+            rebuildDerivedStats: false
+        )
+        try fixture.modelContext.save()
+
+        let snapshot = try #require(try EstimatedKeywordDifficultyStore.snapshot(
+            queryKey: fixture.track.queryKey,
+            in: fixture.modelContext
+        ))
+        #expect(snapshot.rankingSource == .iTunesFallback)
+        #expect(snapshot.fallbackCategory == .other)
+        #expect(snapshot.fallbackHTTPStatus == nil)
+        #expect(snapshot.fallbackResponseFailure == nil)
+    }
+
+    @Test
     func largePageStoresOneCanonicalCopyAndOnlyLegacyPreviewRows() throws {
         let container = try makeInMemoryContainer()
         let modelContext = ModelContext(container)
@@ -2498,6 +2671,86 @@ private func makeDeduplicatedRefreshFixture(in modelContext: ModelContext) throw
     )
 }
 
+private struct EstimatedDifficultyFixture {
+    let modelContext: ModelContext
+    let coordinator: RankingRefreshCoordinator
+    let track: TrackedAppKeyword
+}
+
+@MainActor
+private func makeEstimatedDifficultyFixture() throws -> EstimatedDifficultyFixture {
+    let container = try makeInMemoryContainer()
+    let modelContext = ModelContext(container)
+    modelContext.autosaveEnabled = false
+    let trackedApp = TrackedApp(
+        appStoreID: 4_242,
+        bundleID: "example.tracked.4242",
+        name: "Tracked",
+        sellerName: "Example",
+        defaultPlatform: .iphone
+    )
+    let track = try makeTrackedAppKeyword(
+        term: "difficulty fixture keyword",
+        trackedApp: trackedApp,
+        in: modelContext
+    )
+    trackedApp.keywordTracks.append(track)
+    modelContext.insert(trackedApp)
+    modelContext.insert(track)
+    try modelContext.save()
+
+    let coordinator = RankingRefreshCoordinator(
+        rankingProvider: StubRankingProvider(
+            page: SearchRankingPage(items: [], source: .appStoreWeb)
+        ),
+        appCatalogService: AppCatalogService(appResolver: StubAppResolver())
+    )
+    return EstimatedDifficultyFixture(
+        modelContext: modelContext,
+        coordinator: coordinator,
+        track: track
+    )
+}
+
+private func estimatedDifficultyPageResult(
+    track: TrackedAppKeyword,
+    items: [SearchRankingItem],
+    searchedAt: Date,
+    source: RankingSource = .appStoreWeb,
+    fallbackContext: SearchRankingFailureContext? = nil
+) -> RankingRefreshPageResult {
+    RankingRefreshPageResult(
+        request: RankingRefreshRequest(track: track),
+        page: SearchRankingPage(
+            items: items,
+            source: source,
+            fallbackContext: fallbackContext
+        ),
+        searchedAt: searchedAt,
+        observedHour: nil,
+        submissionCount: 1,
+        winningCount: 1,
+        confidence: "single_source"
+    )
+}
+
+private func ratedRankingItem(
+    position: Int,
+    appStoreID: Int64,
+    ratingCount: Int
+) -> SearchRankingItem {
+    SearchRankingItem(
+        position: position,
+        appStoreID: appStoreID,
+        bundleID: "example.\(appStoreID)",
+        name: "App \(appStoreID)",
+        subtitle: "Fixture subtitle \(appStoreID)",
+        sellerName: "Example",
+        ratingCount: ratingCount,
+        averageRating: 4.2
+    )
+}
+
 private func rankingItem(position: Int, appStoreID: Int64, platform: AppPlatform) -> SearchRankingItem {
     SearchRankingItem(
         position: position,
@@ -3018,6 +3271,8 @@ private func makeInMemoryContainer() throws -> ModelContainer {
         KeywordDailyMetric.self,
         KeywordRankingCrawl.self,
         KeywordAppRanking.self,
+        EstimatedKeywordDifficultyMetric.self,
+        EstimatedKeywordDifficultyResultEvidenceRecord.self,
         TrackedApp.self,
         TrackedAppKeyword.self,
         TrackedKeywordRefreshStatus.self,

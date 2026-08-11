@@ -508,6 +508,191 @@ private struct KeywordPopularityIndicatorPopover: View {
     }
 }
 
+struct KeywordDifficultyCell: View {
+    let row: KeywordWorkspaceRow
+
+    @State private var isShowingIndicatorPopover = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            MetricBarView(
+                value: row.displayDifficultyScore,
+                maxValue: 100,
+                colorScale: .lowGreenHighRed,
+                placeholder: "-"
+            )
+
+            if indicatorState.isVisible {
+                Button {
+                    isShowingIndicatorPopover.toggle()
+                } label: {
+                    Image(systemName: indicatorSystemImage)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(indicatorTint)
+                        .frame(width: 16, height: 16)
+                }
+                .buttonStyle(.plain)
+                .help(indicatorHelp)
+                .accessibilityLabel(indicatorHelp)
+                .popover(isPresented: $isShowingIndicatorPopover, arrowEdge: .bottom) {
+                    KeywordDifficultyIndicatorPopover(state: indicatorState)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(difficultyHelp)
+    }
+
+    private var indicatorState: KeywordDifficultyIndicatorState {
+        row.difficultyIndicatorState
+    }
+
+    private var difficultyHelp: String {
+        "Estimated competition from the current top App Store search results. Not an Apple-provided metric."
+    }
+
+    private var indicatorSystemImage: String {
+        switch indicatorState {
+        case .none:
+            return "circle"
+        case .stale:
+            return "clock.badge.exclamationmark"
+        case .lowConfidence:
+            return "questionmark.circle"
+        case .imported:
+            return "square.and.arrow.down"
+        case .unavailable:
+            return "exclamationmark.circle"
+        }
+    }
+
+    private var indicatorTint: Color {
+        switch indicatorState {
+        case .none:
+            return .secondary
+        case .stale:
+            return .orange
+        case .lowConfidence:
+            return .orange
+        case .imported, .unavailable:
+            return .secondary
+        }
+    }
+
+    private var indicatorHelp: String {
+        switch indicatorState {
+        case .none:
+            return "Estimated difficulty is up to date"
+        case .stale:
+            return "Estimated difficulty is stale"
+        case .lowConfidence:
+            return "Estimated difficulty has low confidence"
+        case .imported:
+            return "Difficulty was imported from CSV"
+        case .unavailable:
+            return "Estimated difficulty unavailable"
+        }
+    }
+}
+
+private struct KeywordDifficultyIndicatorPopover: View {
+    let state: KeywordDifficultyIndicatorState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+                .foregroundStyle(tint)
+
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Difficulty is a heuristic estimated from the current top App Store search results (rating-count authority and title/subtitle keyword saturation). It is not Apple Ads difficulty, Search Popularity, or an Apple-provided metric.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 320, alignment: .leading)
+    }
+
+    private var title: String {
+        switch state {
+        case .none:
+            return "Estimated Difficulty"
+        case .stale:
+            return "Estimate Needs Refresh"
+        case .lowConfidence:
+            return "Low Confidence Estimate"
+        case .imported:
+            return "Imported Difficulty"
+        case .unavailable:
+            return "Estimate Unavailable"
+        }
+    }
+
+    private var message: String {
+        switch state {
+        case .none:
+            return "Estimated difficulty is up to date."
+        case .stale(let rankingFetchedAt):
+            return "This estimate is based on search results fetched on \(rankingFetchedAt.formatted(date: .abbreviated, time: .shortened)). Refresh keyword rankings to update it."
+        case .lowConfidence(let confidenceScore):
+            return "Evidence confidence is low (\(confidenceScore)/100): few of the sampled top results included rating counts. Treat this estimate as directional."
+        case .imported:
+            return "This value was imported from CSV. It will be replaced by OpenASO's estimate after the next ranking refresh."
+        case .unavailable(let reason, let showsImportedFallback):
+            let reasonMessage: String
+            switch reason {
+            case .emptyKeyword:
+                reasonMessage = "Estimated competition is unavailable because the keyword is empty."
+            case .insufficientResults:
+                reasonMessage = "Estimated competition is unavailable until at least 3 unique top-ten ranking results are available."
+            case .insufficientRatingEvidence:
+                reasonMessage = "Estimated competition is unavailable until at least 3 top-ten results include rating counts."
+            }
+            if showsImportedFallback {
+                return "\(reasonMessage) The shown value was imported from CSV."
+            }
+            return reasonMessage
+        }
+    }
+
+    private var systemImage: String {
+        switch state {
+        case .none:
+            return "checkmark.circle.fill"
+        case .stale:
+            return "clock.badge.exclamationmark"
+        case .lowConfidence:
+            return "questionmark.circle"
+        case .imported:
+            return "square.and.arrow.down"
+        case .unavailable:
+            return "exclamationmark.circle"
+        }
+    }
+
+    private var tint: Color {
+        switch state {
+        case .none:
+            return .green
+        case .stale, .lowConfidence:
+            return .orange
+        case .imported, .unavailable:
+            return .secondary
+        }
+    }
+}
+
 #Preview("Keyword Cells") {
     KeywordTableCellsPreview()
 }

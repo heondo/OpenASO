@@ -696,6 +696,7 @@ struct KeywordWorkspaceProjectionTests {
                     updatedAt: updatedAt,
                     notes: nil
                 ),
+                estimatedDifficulty: nil,
                 refreshStatus: .empty,
                 latestSnapshot: summary(id: "focus-updated", rank: 1, date: updatedAt),
                 trendSnapshots: [summary(id: "focus-updated", rank: 1, date: updatedAt)],
@@ -745,6 +746,7 @@ struct KeywordWorkspaceProjectionTests {
                 updatedAt: Date(timeIntervalSince1970: 2_100_000_000),
                 notes: nil
             ),
+            estimatedDifficulty: nil,
             refreshStatus: .empty,
             latestSnapshot: firstSourceRow.latestSnapshot,
             trendSnapshots: firstSourceRow.trendSnapshots,
@@ -842,18 +844,168 @@ struct KeywordWorkspaceProjectionTests {
         )
     }
 
+    @Test
+    func displayDifficultyPrefersEstimateOverImportedValue() {
+        let estimateOnly = makeRow(
+            term: "estimate only",
+            appStoreID: 1,
+            estimatedDifficulty: estimatedDifficulty(score: 61)
+        )
+        let both = makeRow(
+            term: "estimate and import",
+            appStoreID: 2,
+            difficulty: 12,
+            estimatedDifficulty: estimatedDifficulty(score: 88)
+        )
+        let importedOnly = makeRow(term: "import only", appStoreID: 3, difficulty: 34)
+        let neither = makeRow(term: "neither", appStoreID: 4)
+
+        #expect(estimateOnly.displayDifficultyScore == 61)
+        #expect(both.displayDifficultyScore == 88)
+        #expect(importedOnly.displayDifficultyScore == 34)
+        #expect(neither.displayDifficultyScore == nil)
+        #expect(estimateOnly.difficultySortValue == 61)
+        #expect(neither.difficultySortValue == -1)
+    }
+
+    @Test
+    func difficultyFilterMatchesCoalescedScore() {
+        let rows = [
+            makeRow(term: "estimated high", appStoreID: 1, estimatedDifficulty: estimatedDifficulty(score: 90)),
+            makeRow(term: "estimate overrides import", appStoreID: 2, difficulty: 95, estimatedDifficulty: estimatedDifficulty(score: 10)),
+            makeRow(term: "imported high", appStoreID: 3, difficulty: 92),
+            makeRow(term: "unscored", appStoreID: 4)
+        ]
+
+        let filtered = KeywordWorkspaceProjection.filteredRows(
+            rows,
+            filters: filters(difficultyRange: 80...100)
+        )
+        #expect(filtered.map(\.track.term) == ["estimated high", "imported high"])
+    }
+
+    @Test
+    func difficultyIndicatorStateCoversAllSources() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let fresh = makeRow(
+            term: "fresh",
+            appStoreID: 1,
+            estimatedDifficulty: estimatedDifficulty(score: 50, rankingFetchedAt: now)
+        )
+        #expect(fresh.difficultyIndicatorState(now: now) == .none)
+
+        let exactlyStale = makeRow(
+            term: "stale",
+            appStoreID: 2,
+            estimatedDifficulty: estimatedDifficulty(
+                score: 50,
+                rankingFetchedAt: now.addingTimeInterval(-KeywordWorkspaceRow.popularityStaleInterval)
+            )
+        )
+        #expect(exactlyStale.difficultyIndicatorState(now: now) == .stale(
+            rankingFetchedAt: now.addingTimeInterval(-KeywordWorkspaceRow.popularityStaleInterval)
+        ))
+
+        let lowConfidence = makeRow(
+            term: "low confidence",
+            appStoreID: 3,
+            estimatedDifficulty: estimatedDifficulty(
+                score: 50,
+                confidenceScore: 40,
+                confidence: .low,
+                rankingFetchedAt: now
+            )
+        )
+        #expect(lowConfidence.difficultyIndicatorState(now: now) == .lowConfidence(confidenceScore: 40))
+
+        let imported = makeRow(term: "imported", appStoreID: 4, difficulty: 30)
+        #expect(imported.difficultyIndicatorState(now: now) == .imported)
+
+        let unavailableWithFallback = makeRow(
+            term: "unavailable",
+            appStoreID: 5,
+            difficulty: 30,
+            estimatedDifficulty: EstimatedDifficultySummary(
+                score: nil,
+                confidenceScore: nil,
+                confidence: nil,
+                unavailableReason: .insufficientRatingEvidence,
+                rankingFetchedAt: now,
+                computedAt: now
+            )
+        )
+        #expect(unavailableWithFallback.difficultyIndicatorState(now: now) == .unavailable(
+            reason: .insufficientRatingEvidence,
+            showsImportedFallback: true
+        ))
+
+        let none = makeRow(term: "none", appStoreID: 6)
+        #expect(none.difficultyIndicatorState(now: now) == .none)
+        #expect(none.difficultyIndicatorState(now: now).isVisible == false)
+    }
+
+    @Test
+    func tagFilterMatchesAnySelectedTagCaseInsensitively() {
+        let rows = [
+            makeRow(term: "versioned", appStoreID: 1, tags: ["v2.0.2", "brand"]),
+            makeRow(term: "brand only", appStoreID: 2, tags: ["Brand"]),
+            makeRow(term: "other tag", appStoreID: 3, tags: ["v3.0-3.1"]),
+            makeRow(term: "untagged", appStoreID: 4)
+        ]
+
+        let unfiltered = KeywordWorkspaceProjection.filteredRows(rows, filters: filters())
+        #expect(unfiltered.count == 4)
+
+        let brandOnly = KeywordWorkspaceProjection.filteredRows(
+            rows,
+            filters: filters(tagSelection: ["BRAND"])
+        )
+        #expect(brandOnly.map(\.track.term) == ["versioned", "brand only"])
+
+        let orMatch = KeywordWorkspaceProjection.filteredRows(
+            rows,
+            filters: filters(tagSelection: ["brand", "v3.0-3.1"])
+        )
+        #expect(orMatch.map(\.track.term) == ["versioned", "brand only", "other tag"])
+
+        let noMatch = KeywordWorkspaceProjection.filteredRows(
+            rows,
+            filters: filters(tagSelection: ["unused-tag"])
+        )
+        #expect(noMatch.isEmpty)
+    }
+
+    private func estimatedDifficulty(
+        score: Int,
+        confidenceScore: Int = 90,
+        confidence: EstimatedKeywordDifficultyConfidence = .high,
+        rankingFetchedAt: Date = Date(timeIntervalSince1970: 2_000_000_000)
+    ) -> EstimatedDifficultySummary {
+        EstimatedDifficultySummary(
+            score: score,
+            confidenceScore: confidenceScore,
+            confidence: confidence,
+            unavailableReason: nil,
+            rankingFetchedAt: rankingFetchedAt,
+            computedAt: rankingFetchedAt.addingTimeInterval(1)
+        )
+    }
+
     private func filters(
         searchText: String = "",
         popularityRange: ClosedRange<Double> = MetricFilterRange.popularity.defaultRange,
-        changedOnly: Bool = false
+        difficultyRange: ClosedRange<Double> = MetricFilterRange.difficulty.defaultRange,
+        changedOnly: Bool = false,
+        tagSelection: Set<String> = []
     ) -> KeywordWorkspaceProjection.Filters {
         KeywordWorkspaceProjection.Filters(
             searchText: searchText,
             popularityRange: popularityRange,
-            difficultyRange: MetricFilterRange.difficulty.defaultRange,
+            difficultyRange: difficultyRange,
             positionRange: MetricFilterRange.position.defaultRange,
             changeRange: MetricFilterRange.change.defaultRange,
-            showsOnlyChangedKeywords: changedOnly
+            showsOnlyChangedKeywords: changedOnly,
+            tagSelection: tagSelection
         )
     }
 
@@ -863,6 +1015,8 @@ struct KeywordWorkspaceProjectionTests {
         currentRank: Int? = nil,
         popularity: Int? = nil,
         difficulty: Int? = nil,
+        estimatedDifficulty: EstimatedDifficultySummary? = nil,
+        tags: [String] = [],
         trendSnapshots: [KeywordRankingCrawlSummary] = []
     ) -> KeywordWorkspaceRow {
         let trackedApp = TrackedApp(
@@ -903,9 +1057,11 @@ struct KeywordWorkspaceProjectionTests {
                 title: "🇺🇸 United States"
             ),
             metrics: metrics,
+            estimatedDifficulty: estimatedDifficulty,
             latestSnapshot: latestSnapshot,
             trendSnapshots: trendSnapshots,
-            rankingApps: []
+            rankingApps: [],
+            tags: tags
         )
     }
 

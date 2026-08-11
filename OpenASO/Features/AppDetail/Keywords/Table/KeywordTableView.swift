@@ -32,6 +32,7 @@ struct KeywordTableView: View, Equatable {
     @State private var presentedRankingRow: KeywordWorkspaceRow?
     @State private var presentedRankingHistoryRow: KeywordWorkspaceRow?
     @State private var presentedNotesRow: KeywordWorkspaceRow?
+    @State private var presentedTagsRow: KeywordWorkspaceRow?
     @State private var actionErrorMessage: String?
     @State private var rowsPendingDeletion: [KeywordWorkspaceRow] = []
 
@@ -101,6 +102,7 @@ struct KeywordTableView: View, Equatable {
                     presentRanking: presentRanking,
                     presentRankingHistory: { presentedRankingHistoryRow = $0 },
                     presentNotes: { presentedNotesRow = $0 },
+                    presentTags: { presentedTagsRow = $0 },
                     setChartSelection: setChartSelection,
                     openAppleAdsSettings: openAppleAdsSettings
                 )
@@ -184,6 +186,18 @@ struct KeywordTableView: View, Equatable {
                     "Keyword Unavailable",
                     systemImage: "exclamationmark.triangle",
                     description: Text("The keyword was removed before its notes could be opened.")
+                )
+                .frame(width: 420, height: 220)
+            }
+        }
+        .sheet(item: $presentedTagsRow) { row in
+            if let track = try? trackedKeyword(identityKey: row.track.identityKey) {
+                KeywordTagsSheet(track: track)
+            } else {
+                ContentUnavailableView(
+                    "Keyword Unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text("The keyword was removed before its tags could be opened.")
                 )
                 .frame(width: 420, height: 220)
             }
@@ -302,6 +316,10 @@ struct KeywordTableView: View, Equatable {
                 for: rows.map(\.track.identityKey),
                 in: modelContext
             )
+            try TrackedKeywordTagStore.deleteTags(
+                for: rows.map(\.track.identityKey),
+                in: modelContext
+            )
             rows.forEach { row in
                 chartKeys.remove(row.track.identityKey)
             }
@@ -390,6 +408,13 @@ struct KeywordTableView: View, Equatable {
             copiedTrack.notes = row.track.notes
             trackedApp.keywordTracks.append(copiedTrack)
             modelContext.insert(copiedTrack)
+            if !row.track.tags.isEmpty {
+                _ = try? TrackedKeywordTagStore.setTags(
+                    row.track.tags,
+                    for: copiedTrack,
+                    in: modelContext
+                )
+            }
             mutableExistingKeys.insert(identityKey)
             insertedTracks.append(copiedTrack)
         }
@@ -510,85 +535,120 @@ private struct KeywordRowsTable: View {
     let presentRanking: (KeywordWorkspaceRow) -> Void
     let presentRankingHistory: (KeywordWorkspaceRow) -> Void
     let presentNotes: (KeywordWorkspaceRow) -> Void
+    let presentTags: (KeywordWorkspaceRow) -> Void
     let setChartSelection: (Bool, KeywordWorkspaceRow) -> Void
     let openAppleAdsSettings: () -> Void
 
     var body: some View {
+        // TableColumnBuilder tops out at ten column blocks; the split builder
+        // properties keep room for further columns and keep the expression
+        // type-checkable.
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Keyword", value: \.keywordSortValue) { tableRow in
-                KeywordCell(row: tableRow.row)
-            }
-            .width(min: 160, ideal: 230)
-
-            TableColumn("Last updated", value: \.lastUpdatedSortValue) { tableRow in
-                KeywordLastUpdatedCell(row: tableRow.row)
-            }
-            .width(min: 92, ideal: 112, max: 132)
-
-            TableColumn("Country", value: \.storefrontSortValue) { tableRow in
-                KeywordStoreCell(row: tableRow.row)
-            }
-            .width(min: 100, ideal: 148)
-
-            if showsPlatformColumn {
-                TableColumn("Platform", value: \.platformSortValue) { tableRow in
-                    KeywordPlatformCell(platform: tableRow.row.track.platform)
-                }
-                .width(min: 92, ideal: 104, max: 116)
-            }
-
-            TableColumn("Popularity", value: \.popularitySortValue) { tableRow in
-                KeywordPopularityCell(
-                    row: tableRow.row,
-                    requiresAppleAdsReconnect: requiresAppleAdsReconnect,
-                    openAppleAdsSettings: openAppleAdsSettings
-                )
-            }
-            .width(min: 112, ideal: 124, max: 136)
-
-            TableColumn("Position", value: \.positionSortValue) { tableRow in
-                KeywordPositionCell(row: tableRow.row)
-            }
-            .width(min: 76, ideal: 88, max: 100)
-
-            TableColumn("Trend", value: \.trendSortValue) { tableRow in
-                KeywordTrendButton(row: tableRow.row) {
-                    presentRankingHistory(tableRow.row)
-                }
-            }
-            .width(min: 120, ideal: 132, max: 152)
-
-            TableColumn("Apps in Ranking") { tableRow in
-                AppsInRankingButton(
-                    row: tableRow.row,
-                    trackedAppStoreID: trackedAppStoreID,
-                    modelContext: modelContext,
-                    appCatalogService: appCatalogService,
-                    appIconStore: appIconStore,
-                    presentRanking: presentRanking
-                )
-            }
-            .width(min: 132, ideal: 220)
-
-            TableColumn("Notes") { tableRow in
-                KeywordNotesCell(row: tableRow.row) {
-                    presentNotes(tableRow.row)
-                }
-            }
-            .width(min: 120, ideal: 180)
-
-            TableColumn("Chart", value: \.chartSelectionSortValue) { tableRow in
-                ChartSelectionButton(
-                    isSelected: tableRow.isSelectedForChart,
-                    setSelection: { isSelected in
-                        setChartSelection(isSelected, tableRow.row)
-                    }
-                )
-                .frame(maxWidth: .infinity, alignment: .center)
-            }
-            .width(min: 56, ideal: 60, max: 68)
+            leadingColumns
+            trailingColumns
         }
         .tint(.accentColor)
+    }
+
+    @TableColumnBuilder<KeywordTablePresentationRow, KeyPathComparator<KeywordTablePresentationRow>>
+    private var leadingColumns: some TableColumnContent<
+        KeywordTablePresentationRow,
+        KeyPathComparator<KeywordTablePresentationRow>
+    > {
+        Group {
+                TableColumn("Keyword", value: \KeywordTablePresentationRow.keywordSortValue) { tableRow in
+                    KeywordCell(row: tableRow.row)
+                }
+                .width(min: 160, ideal: 230)
+
+                TableColumn("Last updated", value: \.lastUpdatedSortValue) { tableRow in
+                    KeywordLastUpdatedCell(row: tableRow.row)
+                }
+                .width(min: 92, ideal: 112, max: 132)
+
+                TableColumn("Country", value: \.storefrontSortValue) { tableRow in
+                    KeywordStoreCell(row: tableRow.row)
+                }
+                .width(min: 100, ideal: 148)
+
+                if showsPlatformColumn {
+                    TableColumn("Platform", value: \.platformSortValue) { tableRow in
+                        KeywordPlatformCell(platform: tableRow.row.track.platform)
+                    }
+                    .width(min: 92, ideal: 104, max: 116)
+                }
+
+                TableColumn("Popularity", value: \.popularitySortValue) { tableRow in
+                    KeywordPopularityCell(
+                        row: tableRow.row,
+                        requiresAppleAdsReconnect: requiresAppleAdsReconnect,
+                        openAppleAdsSettings: openAppleAdsSettings
+                    )
+                }
+                .width(min: 112, ideal: 124, max: 136)
+
+                TableColumn("Difficulty", value: \.difficultySortValue) { tableRow in
+                    KeywordDifficultyCell(row: tableRow.row)
+                }
+                .width(min: 112, ideal: 124, max: 136)
+        }
+    }
+
+    @TableColumnBuilder<KeywordTablePresentationRow, KeyPathComparator<KeywordTablePresentationRow>>
+    private var trailingColumns: some TableColumnContent<
+        KeywordTablePresentationRow,
+        KeyPathComparator<KeywordTablePresentationRow>
+    > {
+            Group {
+                TableColumn("Position", value: \KeywordTablePresentationRow.positionSortValue) { tableRow in
+                    KeywordPositionCell(row: tableRow.row)
+                }
+                .width(min: 76, ideal: 88, max: 100)
+
+                TableColumn("Trend", value: \.trendSortValue) { tableRow in
+                    KeywordTrendButton(row: tableRow.row) {
+                        presentRankingHistory(tableRow.row)
+                    }
+                }
+                .width(min: 120, ideal: 132, max: 152)
+
+                TableColumn("Apps in Ranking") { tableRow in
+                    AppsInRankingButton(
+                        row: tableRow.row,
+                        trackedAppStoreID: trackedAppStoreID,
+                        modelContext: modelContext,
+                        appCatalogService: appCatalogService,
+                        appIconStore: appIconStore,
+                        presentRanking: presentRanking
+                    )
+                }
+                .width(min: 132, ideal: 220)
+
+                TableColumn("Notes") { tableRow in
+                    KeywordNotesCell(row: tableRow.row) {
+                        presentNotes(tableRow.row)
+                    }
+                }
+                .width(min: 120, ideal: 180)
+
+                TableColumn("Tags", value: \.tagsSortValue) { tableRow in
+                    KeywordTagsCell(row: tableRow.row) {
+                        presentTags(tableRow.row)
+                    }
+                }
+                .width(min: 120, ideal: 170)
+
+                TableColumn("Chart", value: \.chartSelectionSortValue) { tableRow in
+                    ChartSelectionButton(
+                        isSelected: tableRow.isSelectedForChart,
+                        setSelection: { isSelected in
+                            setChartSelection(isSelected, tableRow.row)
+                        }
+                    )
+                    .frame(maxWidth: .infinity, alignment: .center)
+                }
+                .width(min: 56, ideal: 60, max: 68)
+            }
     }
 }
 
@@ -602,8 +662,10 @@ struct KeywordTablePresentationRow: Identifiable, Equatable {
     var storefrontSortValue: String { row.storefrontSortValue }
     var platformSortValue: Int { row.track.platform.tableSortValue }
     var popularitySortValue: Int { row.popularitySortValue }
+    var difficultySortValue: Int { row.difficultySortValue }
     var positionSortValue: Int { row.positionSortValue }
     var trendSortValue: Int { row.trendSortValue }
+    var tagsSortValue: String { row.track.tags.joined(separator: "\u{1F}").lowercased() }
     var chartSelectionSortValue: Int { isSelectedForChart ? 0 : 1 }
 }
 

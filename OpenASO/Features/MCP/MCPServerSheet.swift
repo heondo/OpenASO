@@ -342,8 +342,10 @@ struct MCPServerSheet: View {
 
     private func toggleServer() {
         if controller.state.isRunning {
+            settingsStore.saveMCPServerAutostart(false)
             controller.stop()
         } else {
+            settingsStore.saveMCPServerAutostart(true)
             controller.start()
         }
     }

@@ -221,6 +221,16 @@ struct OpenASOMCPServerFactory: Sendable {
             )
             return try Self.toolResult(result)
 
+        case "update_keyword_tags":
+            let result = try await service.updateKeywordTags(
+                appStoreID: try arguments.requiredInt64("appStoreID"),
+                keyword: try arguments.requiredString("keyword"),
+                storefront: try arguments.requiredString("storefront"),
+                platform: arguments.string("platform"),
+                tags: try arguments.requiredStringArray("tags", allowEmpty: true)
+            )
+            return try Self.toolResult(result)
+
         case "list_screenshots":
             let result = try await service.listScreenshots(
                 appStoreID: try arguments.requiredInt64("appStoreID"),
@@ -493,7 +503,7 @@ private extension OpenASOMCPServerFactory {
                     "cursor": .string
                 ]) { current, _ in current }
             ), readOnly: true),
-            tool("list_keywords", "List tracked keywords with latest rank and metrics.", schema(
+            tool("list_keywords", "List tracked keywords with latest rank, metrics (including estimated difficulty), and tags.", schema(
                 required: ["appStoreID"],
                 optional: commonAppFilters.merging(["limit": .integer, "cursor": .string]) { current, _ in current }
             ), readOnly: true),
@@ -508,6 +518,10 @@ private extension OpenASOMCPServerFactory {
             tool("update_keyword_notes", "Update notes for one tracked keyword.", schema(
                 required: ["appStoreID", "keyword", "storefront", "notes"],
                 optional: ["appStoreID": .integer, "keyword": .string, "storefront": .string, "platform": .string, "notes": .string]
+            ), readOnly: false, destructive: false, idempotent: true),
+            tool("update_keyword_tags", "Replace the full free-form tag list on one tracked keyword; pass the complete list, and an empty list clears it. Tags group keywords for table filtering and automation, for example release-version tags like v2.0.2 or v3.0-3.1, or brand.", schema(
+                required: ["appStoreID", "keyword", "storefront", "tags"],
+                optional: ["appStoreID": .integer, "keyword": .string, "storefront": .string, "platform": .string, "tags": .stringArray]
             ), readOnly: false, destructive: false, idempotent: true),
             tool("list_screenshots", "List stored App Store screenshot metadata.", schema(
                 required: ["appStoreID"],
@@ -983,8 +997,8 @@ private extension Dictionary where Key == String, Value == MCP.Value {
         }
     }
 
-    func requiredStringArray(_ key: String) throws -> [String] {
-        guard let values = stringArray(key), !values.isEmpty else {
+    func requiredStringArray(_ key: String, allowEmpty: Bool = false) throws -> [String] {
+        guard let values = stringArray(key), allowEmpty || !values.isEmpty else {
             throw MCPError.invalidParams("Missing required string array argument: \(key)")
         }
         return values

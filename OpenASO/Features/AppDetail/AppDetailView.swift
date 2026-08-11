@@ -77,6 +77,7 @@ struct AppDetailView: View {
                     positionFilterRange: keywordWorkspaceState.positionFilterRange,
                     changeFilterRange: keywordWorkspaceState.changeFilterRange,
                     showsOnlyChangedKeywords: keywordWorkspaceState.showsOnlyChangedKeywords,
+                    tagSelection: keywordWorkspaceState.tagSelection,
                     refreshToken: keywordRefreshToken,
                     reportError: setErrorMessage
                 )
@@ -104,7 +105,8 @@ struct AppDetailView: View {
             ToolbarItemGroup {
                 if selectedWorkspaceView == .keywords {
                     AppDetailFilterToolbarItems(
-                        keywordWorkspaceState: $keywordWorkspaceState
+                        keywordWorkspaceState: $keywordWorkspaceState,
+                        trackedAppStoreID: appStoreID
                     )
                 }
             }
@@ -645,9 +647,21 @@ struct AppDetailView: View {
             for: tracks.map(\.queryKey),
             in: modelContext
         )
+        let estimatedDifficultyByQueryKey = try EstimatedKeywordDifficultyStore.snapshots(
+            queryKeys: tracks.map(\.queryKey),
+            in: modelContext
+        )
+        let tagsByIdentityKey = try TrackedKeywordTagStore.tagsByIdentityKey(
+            for: tracks,
+            in: modelContext
+        )
         let rows = tracks.map { track in
             let snapshot = track.latestSnapshot
             let metrics = metricsByQueryKey[track.queryKey]
+            let difficulty = effectiveDifficultyScore(
+                estimated: estimatedDifficultyByQueryKey[track.queryKey],
+                imported: metrics?.difficultyScore
+            )
 
             return TrackedKeywordCSVRow(
                 appName: appName,
@@ -661,9 +675,9 @@ struct AppDetailView: View {
                 ranking: snapshot?.rank.map(String.init) ?? "1000",
                 change: changeText(for: track),
                 popularity: metrics?.popularityScore.map(String.init) ?? "",
-                difficulty: metrics?.difficultyScore.map(String.init) ?? "",
+                difficulty: difficulty.map(String.init) ?? "",
                 appsInRanking: String(track.rankingAppCount ?? snapshot?.resultCount ?? 0),
-                tags: ""
+                tags: KeywordTagNormalization.joinCSVField(tagsByIdentityKey[track.identityKey] ?? [])
             )
         }
 
@@ -676,20 +690,50 @@ struct AppDetailView: View {
             for: tracks.map(\.queryKey),
             in: modelContext
         )
+        let estimatedDifficultyByQueryKey = try EstimatedKeywordDifficultyStore.snapshots(
+            queryKeys: tracks.map(\.queryKey),
+            in: modelContext
+        )
+        let tagsByIdentityKey = try TrackedKeywordTagStore.tagsByIdentityKey(
+            for: tracks,
+            in: modelContext
+        )
         let rows = tracks
             .filter { matchesExportStorefront($0) }
             .filter { matchesExportPlatform($0) }
             .filter { matchesExportSearch($0) }
-            .filter { matchesExportMetrics($0, metrics: metricsByQueryKey[$0.queryKey]) }
+            .filter {
+                matchesExportMetrics(
+                    $0,
+                    metrics: metricsByQueryKey[$0.queryKey],
+                    estimatedDifficultyScore: estimatedScore(estimatedDifficultyByQueryKey[$0.queryKey])
+                )
+            }
             .filter(matchesExportChangedOnly)
+            .filter { matchesExportTags($0, tags: tagsByIdentityKey[$0.identityKey] ?? []) }
             .flatMap { track in
                 historicalRankingRows(
                     for: track,
-                    metrics: metricsByQueryKey[track.queryKey]
+                    metrics: metricsByQueryKey[track.queryKey],
+                    estimatedDifficultyScore: estimatedScore(estimatedDifficultyByQueryKey[track.queryKey])
                 )
             }
 
         return CSVDocument(text: KeywordRankingHistoryCSVFormat.encode(rows: rows))
+    }
+
+    private func estimatedScore(_ snapshot: EstimatedKeywordDifficultySnapshot?) -> Int? {
+        guard let snapshot, snapshot.state == .estimated else { return nil }
+        return snapshot.score
+    }
+
+    /// Merged-column rule shared with the table: the native estimate wins and
+    /// a CSV-imported value is only the fallback.
+    private func effectiveDifficultyScore(
+        estimated: EstimatedKeywordDifficultySnapshot?,
+        imported: Int?
+    ) -> Int? {
+        estimatedScore(estimated) ?? imported
     }
 
     private func makeRatingsExportDocument() async throws -> CSVDocument {
@@ -758,7 +802,8 @@ struct AppDetailView: View {
 
     private func historicalRankingRows(
         for track: TrackedAppKeyword,
-        metrics: KeywordDailyMetric?
+        metrics: KeywordDailyMetric?,
+        estimatedDifficultyScore: Int? = nil
     ) -> [KeywordRankingHistoryCSVRow] {
         let snapshots = filteredSnapshots(for: track).sorted { $0.searchedAt < $1.searchedAt }
         guard
@@ -788,7 +833,7 @@ struct AppDetailView: View {
                 change: snapshotChange,
                 periodChange: periodChange,
                 popularity: metrics?.popularityScore.map(String.init) ?? "",
-                difficulty: metrics?.difficultyScore.map(String.init) ?? "",
+                difficulty: (estimatedDifficultyScore ?? metrics?.difficultyScore).map(String.init) ?? "",
                 appsInRanking: String(snapshot.resultCount),
                 source: snapshot.sourceRaw,
                 error: snapshot.errorMessage ?? ""
@@ -828,9 +873,14 @@ struct AppDetailView: View {
         return track.term.localizedCaseInsensitiveContains(trimmedSearch)
     }
 
-    private func matchesExportMetrics(_ track: TrackedAppKeyword, metrics: KeywordDailyMetric?) -> Bool {
+    private func matchesExportMetrics(
+        _ track: TrackedAppKeyword,
+        metrics: KeywordDailyMetric?,
+        estimatedDifficultyScore: Int? = nil
+    ) -> Bool {
+        let difficultyScore = estimatedDifficultyScore ?? metrics?.difficultyScore
         guard matchesExportValue(metrics?.popularityScore, in: keywordWorkspaceState.popularityFilterRange, configuration: .popularity),
-              matchesExportValue(metrics?.difficultyScore, in: keywordWorkspaceState.difficultyFilterRange, configuration: .difficulty)
+              matchesExportValue(difficultyScore, in: keywordWorkspaceState.difficultyFilterRange, configuration: .difficulty)
         else {
             return false
         }
@@ -841,6 +891,11 @@ struct AppDetailView: View {
         }
 
         return matchesExportValue(latestRank, in: keywordWorkspaceState.positionFilterRange, configuration: .position)
+    }
+
+    private func matchesExportTags(_ track: TrackedAppKeyword, tags: [String]) -> Bool {
+        let selection = keywordWorkspaceState.tagSelection
+        return selection.isEmpty || tags.contains { selection.contains($0.lowercased()) }
     }
 
     private func matchesExportChangedOnly(_ track: TrackedAppKeyword) -> Bool {
@@ -1053,6 +1108,13 @@ struct AppDetailView: View {
                 appForRow.keywordTracks.append(importedTrack)
                 modelContext.insert(importedTrack)
                 applyImportedValues(from: row, to: importedTrack)
+                // Lenient import: bad tags are dropped by normalization, never
+                // failing the row.
+                _ = try? TrackedKeywordTagStore.setTags(
+                    KeywordTagNormalization.splitCSVField(row.tags),
+                    for: importedTrack,
+                    in: modelContext
+                )
                 insertMetrics(from: row, for: importedTrack, metricsByQueryKey: &metricsByQueryKey)
 
                 existingKeys.insert(duplicateKey)

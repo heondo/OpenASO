@@ -674,8 +674,10 @@ struct SettingsView: View {
 
     private func toggleMCPServer() {
         if services.mcpServerController.state.isRunning {
+            services.settingsStore.saveMCPServerAutostart(false)
             services.mcpServerController.stop()
         } else {
+            services.settingsStore.saveMCPServerAutostart(true)
             services.mcpServerController.start()
         }
     }

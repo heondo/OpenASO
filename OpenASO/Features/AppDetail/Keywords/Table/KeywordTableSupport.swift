@@ -281,6 +281,45 @@ struct KeywordMetricsSnapshot: Equatable, Sendable {
     }
 }
 
+/// Compact row-side view of the latest `EstimatedKeywordDifficultySnapshot`;
+/// rows are compared constantly, so the per-result evidence stays behind.
+struct EstimatedDifficultySummary: Equatable, Sendable {
+    let score: Int?
+    let confidenceScore: Int?
+    let confidence: EstimatedKeywordDifficultyConfidence?
+    let unavailableReason: EstimatedKeywordDifficultyUnavailableReason?
+    let rankingFetchedAt: Date
+    let computedAt: Date
+
+    init(
+        score: Int?,
+        confidenceScore: Int?,
+        confidence: EstimatedKeywordDifficultyConfidence?,
+        unavailableReason: EstimatedKeywordDifficultyUnavailableReason?,
+        rankingFetchedAt: Date,
+        computedAt: Date
+    ) {
+        self.score = score
+        self.confidenceScore = confidenceScore
+        self.confidence = confidence
+        self.unavailableReason = unavailableReason
+        self.rankingFetchedAt = rankingFetchedAt
+        self.computedAt = computedAt
+    }
+
+    init(_ snapshot: EstimatedKeywordDifficultySnapshot) {
+        let isEstimated = snapshot.state == .estimated
+        self.init(
+            score: isEstimated ? snapshot.score : nil,
+            confidenceScore: isEstimated ? snapshot.confidenceScore : nil,
+            confidence: isEstimated ? snapshot.confidence : nil,
+            unavailableReason: isEstimated ? nil : snapshot.unavailableReason,
+            rankingFetchedAt: snapshot.rankingFetchedAt,
+            computedAt: snapshot.computedAt
+        )
+    }
+}
+
 struct KeywordTrackSnapshot: Identifiable, Equatable, Hashable, Sendable {
     let identityKey: String
     let appStoreID: Int64
@@ -291,6 +330,7 @@ struct KeywordTrackSnapshot: Identifiable, Equatable, Hashable, Sendable {
     let rankingAppCount: Int?
     let lastRefreshAt: Date?
     let notes: String
+    let tags: [String]
     let statusMessage: String?
     let createdAt: Date
 
@@ -304,6 +344,7 @@ struct KeywordTrackSnapshot: Identifiable, Equatable, Hashable, Sendable {
         rankingAppCount: Int?,
         lastRefreshAt: Date?,
         notes: String,
+        tags: [String] = [],
         statusMessage: String?,
         createdAt: Date
     ) {
@@ -316,11 +357,12 @@ struct KeywordTrackSnapshot: Identifiable, Equatable, Hashable, Sendable {
         self.rankingAppCount = rankingAppCount
         self.lastRefreshAt = lastRefreshAt
         self.notes = notes
+        self.tags = tags
         self.statusMessage = statusMessage
         self.createdAt = createdAt
     }
 
-    init(_ track: TrackedAppKeyword) {
+    init(_ track: TrackedAppKeyword, tags: [String] = []) {
         self.init(
             identityKey: track.identityKey,
             appStoreID: track.appStoreID,
@@ -331,6 +373,7 @@ struct KeywordTrackSnapshot: Identifiable, Equatable, Hashable, Sendable {
             rankingAppCount: track.rankingAppCount,
             lastRefreshAt: track.lastRefreshAt,
             notes: track.notes,
+            tags: tags,
             statusMessage: track.statusMessage,
             createdAt: track.createdAt
         )
@@ -345,6 +388,7 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
     let track: KeywordTrackSnapshot
     let storefront: StorefrontDefinition?
     let metrics: KeywordMetricsSnapshot?
+    let estimatedDifficulty: EstimatedDifficultySummary?
     let refreshStatus: KeywordRefreshStatusSnapshot
     let latestSnapshot: KeywordRankingCrawlSummary?
     let trendSnapshots: [KeywordRankingCrawlSummary]
@@ -358,6 +402,7 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
         track: KeywordTrackSnapshot,
         storefront: StorefrontDefinition?,
         metrics: KeywordMetricsSnapshot?,
+        estimatedDifficulty: EstimatedDifficultySummary? = nil,
         refreshStatus: KeywordRefreshStatusSnapshot = .empty,
         latestSnapshot: KeywordRankingCrawlSummary?,
         trendSnapshots: [KeywordRankingCrawlSummary],
@@ -367,6 +412,7 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
         self.track = track
         self.storefront = storefront
         self.metrics = metrics
+        self.estimatedDifficulty = estimatedDifficulty
         self.refreshStatus = refreshStatus
         self.latestSnapshot = latestSnapshot
         self.currentRank = latestSnapshot?.rank
@@ -392,16 +438,19 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
         track: TrackedAppKeyword,
         storefront: StorefrontDefinition?,
         metrics: KeywordMetricsSnapshot?,
+        estimatedDifficulty: EstimatedDifficultySummary? = nil,
         refreshStatus: KeywordRefreshStatusSnapshot = .empty,
         latestSnapshot: KeywordRankingCrawlSummary?,
         trendSnapshots: [KeywordRankingCrawlSummary],
         rankingApps: [KeywordRankingAppSummary],
-        allRankingApps: [KeywordRankingAppSummary]? = nil
+        allRankingApps: [KeywordRankingAppSummary]? = nil,
+        tags: [String] = []
     ) {
         self.init(
-            track: KeywordTrackSnapshot(track),
+            track: KeywordTrackSnapshot(track, tags: tags),
             storefront: storefront,
             metrics: metrics,
+            estimatedDifficulty: estimatedDifficulty,
             refreshStatus: refreshStatus,
             latestSnapshot: latestSnapshot,
             trendSnapshots: trendSnapshots,
@@ -414,21 +463,25 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
         track: TrackedAppKeyword,
         storefront: StorefrontDefinition?,
         metrics: KeywordDailyMetric?,
+        estimatedDifficulty: EstimatedDifficultySummary? = nil,
         refreshStatus: KeywordRefreshStatusSnapshot = .empty,
         latestSnapshot: KeywordRankingCrawlSummary?,
         trendSnapshots: [KeywordRankingCrawlSummary],
         rankingApps: [KeywordRankingAppSummary],
-        allRankingApps: [KeywordRankingAppSummary]? = nil
+        allRankingApps: [KeywordRankingAppSummary]? = nil,
+        tags: [String] = []
     ) {
         self.init(
             track: track,
             storefront: storefront,
             metrics: metrics.map(KeywordMetricsSnapshot.init),
+            estimatedDifficulty: estimatedDifficulty,
             refreshStatus: refreshStatus,
             latestSnapshot: latestSnapshot,
             trendSnapshots: trendSnapshots,
             rankingApps: rankingApps,
-            allRankingApps: allRankingApps
+            allRankingApps: allRankingApps,
+            tags: tags
         )
     }
 
@@ -436,20 +489,24 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
         track: TrackedAppKeyword,
         storefront: StorefrontDefinition?,
         metrics: KeywordDailyMetric?,
+        estimatedDifficulty: EstimatedDifficultySummary? = nil,
         refreshStatus: KeywordRefreshStatusSnapshot = .empty,
         latestSnapshot: TrackedKeywordDailyRanking?,
         trendSnapshots: [TrackedKeywordDailyRanking],
-        rankingApps: [TrackedKeywordRankedResult]
+        rankingApps: [TrackedKeywordRankedResult],
+        tags: [String] = []
     ) {
         self.init(
             track: track,
             storefront: storefront,
             metrics: metrics.map(KeywordMetricsSnapshot.init),
+            estimatedDifficulty: estimatedDifficulty,
             refreshStatus: refreshStatus,
             latestSnapshot: latestSnapshot.map(KeywordRankingCrawlSummary.init),
             trendSnapshots: trendSnapshots.map(KeywordRankingCrawlSummary.init),
             rankingApps: rankingApps.map(KeywordRankingAppSummary.init),
-            allRankingApps: rankingApps.map(KeywordRankingAppSummary.init)
+            allRankingApps: rankingApps.map(KeywordRankingAppSummary.init),
+            tags: tags
         )
     }
 
@@ -457,6 +514,7 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
 
     func updating(
         metrics: KeywordMetricsSnapshot?,
+        estimatedDifficulty: EstimatedDifficultySummary?,
         refreshStatus: KeywordRefreshStatusSnapshot,
         latestSnapshot: KeywordRankingCrawlSummary?,
         trendSnapshots: [KeywordRankingCrawlSummary],
@@ -466,6 +524,7 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
             track: track,
             storefront: storefront,
             metrics: metrics,
+            estimatedDifficulty: estimatedDifficulty,
             refreshStatus: refreshStatus,
             latestSnapshot: latestSnapshot,
             trendSnapshots: trendSnapshots,
@@ -482,6 +541,15 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
     }
 
     var popularitySortValue: Int { metrics?.popularityScore ?? -1 }
+
+    /// Merged-column rule: the native estimate wins; a CSV-imported
+    /// `KeywordDailyMetric.difficultyScore` is only the fallback until the
+    /// next ranking refresh produces an estimate.
+    var displayDifficultyScore: Int? {
+        estimatedDifficulty?.score ?? metrics?.difficultyScore
+    }
+
+    var difficultySortValue: Int { displayDifficultyScore ?? -1 }
 
     var positionSortValue: Int { currentRank ?? Int.max }
 
@@ -638,6 +706,47 @@ struct KeywordWorkspaceRow: Identifiable, Equatable, Sendable {
 
         return .none
     }
+
+    var difficultyIndicatorState: KeywordDifficultyIndicatorState {
+        difficultyIndicatorState(now: .now)
+    }
+
+    func difficultyIndicatorState(now: Date) -> KeywordDifficultyIndicatorState {
+        guard let estimatedDifficulty else {
+            return metrics?.difficultyScore == nil ? .none : .imported
+        }
+
+        guard estimatedDifficulty.score != nil else {
+            return .unavailable(
+                reason: estimatedDifficulty.unavailableReason ?? .insufficientResults,
+                showsImportedFallback: metrics?.difficultyScore != nil
+            )
+        }
+
+        // Freshness follows the ranking evidence, matching the store snapshot.
+        if now.timeIntervalSince(estimatedDifficulty.rankingFetchedAt) >= Self.popularityStaleInterval {
+            return .stale(rankingFetchedAt: estimatedDifficulty.rankingFetchedAt)
+        }
+
+        if estimatedDifficulty.confidence == .low {
+            return .lowConfidence(confidenceScore: estimatedDifficulty.confidenceScore ?? 0)
+        }
+
+        return .none
+    }
+}
+
+enum KeywordDifficultyIndicatorState: Equatable {
+    case none
+    case stale(rankingFetchedAt: Date)
+    case lowConfidence(confidenceScore: Int)
+    case imported
+    case unavailable(
+        reason: EstimatedKeywordDifficultyUnavailableReason,
+        showsImportedFallback: Bool
+    )
+
+    var isVisible: Bool { self != .none }
 }
 
 struct KeywordRankingCrawlSummary: Identifiable, Equatable, Sendable {

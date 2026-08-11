@@ -6,6 +6,7 @@ final class KeywordInsightsService {
     struct Workspace: Sendable {
         struct Row: Sendable {
             let metrics: KeywordMetricsSnapshot?
+            let estimatedDifficulty: EstimatedDifficultySummary?
             let refreshStatus: KeywordRefreshStatusSnapshot
             let latestSnapshot: KeywordRankingCrawlSummary?
             let trendSnapshots: [KeywordRankingCrawlSummary]
@@ -205,6 +206,9 @@ final class KeywordInsightsService {
             queryKeys: queryKeys,
             in: modelContext
         )
+        let estimatedDifficultyByQueryKey = try EstimatedKeywordDifficultyStore
+            .snapshots(queryKeys: queryKeys, in: modelContext)
+            .mapValues(EstimatedDifficultySummary.init)
         let refreshStatusesByIdentityKey = try TrackedKeywordRefreshStatusStore.snapshots(
             for: tracks.map(\.identityKey),
             in: modelContext
@@ -259,6 +263,7 @@ final class KeywordInsightsService {
                     track.identityKey,
                     Workspace.Row(
                         metrics: metricsByQueryKey[track.queryKey],
+                        estimatedDifficulty: estimatedDifficultyByQueryKey[track.queryKey],
                         refreshStatus: TrackedKeywordRefreshStatusStore.snapshot(
                             trackCreatedAt: track.createdAt,
                             legacyMessage: track.legacyStatusMessage,

@@ -214,8 +214,20 @@ struct OpenASOMCPKeywordSummary: Codable, Identifiable, Sendable {
     let rankDelta: Int?
     let resultCount: Int?
     let popularityScore: Int?
+    /// CSV-imported difficulty only; OpenASO never computes this field.
     let difficultyScore: Int?
+    /// Native "top10-authority-saturation" heuristic computed on ranking
+    /// refresh. Not Apple Ads difficulty or an Apple-provided metric.
+    let estimatedDifficultyScore: Int?
+    let estimatedDifficultyConfidence: String?
+    let estimatedDifficultyConfidenceScore: Int?
+    let estimatedDifficultyUnavailableReason: String?
+    let estimatedDifficultyRankingFetchedAt: Date?
+    /// Merged value matching the app's Difficulty column: the native estimate
+    /// when present, otherwise the imported score.
+    let effectiveDifficultyScore: Int?
     let notes: String
+    let tags: [String]
     let rankingStatusMessage: String?
     let popularityStatusMessage: String?
     let statusMessage: String?
@@ -287,6 +299,11 @@ struct OpenASOMCPSkippedKeyword: Codable, Sendable, Equatable {
 }
 
 struct OpenASOMCPKeywordNotesResult: Codable, Sendable {
+    let track: OpenASOMCPKeywordSummary
+    let summary: OpenASOMCPMutationSummary
+}
+
+struct OpenASOMCPKeywordTagsResult: Codable, Sendable {
     let track: OpenASOMCPKeywordSummary
     let summary: OpenASOMCPMutationSummary
 }

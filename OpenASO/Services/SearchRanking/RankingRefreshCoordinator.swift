@@ -595,6 +595,9 @@ final class RankingRefreshCoordinator: Sendable {
         in modelContext: ModelContext,
         catalogEvidenceAppStoreIDs: Set<Int64>? = nil
     ) throws -> RankingObservationPersistenceResult {
+        // Canonicalization rebuilds the page and drops its fallback context;
+        // capture the provenance before the parameter is shadowed below.
+        let fallbackContext = pageResult.page.fallbackContext
         let pageResult = pageResult.canonicalized(
             limit: SearchRankingCrawl.fullKeywordRankingLimit
         )
@@ -726,10 +729,52 @@ final class RankingRefreshCoordinator: Sendable {
             in: modelContext
         )
 
+        persistEstimatedDifficultyObservation(
+            for: pageResult,
+            fallbackContext: fallbackContext,
+            in: modelContext
+        )
+
         return RankingObservationPersistenceResult(
             observation: observation,
             appliedIncomingPage: true
         )
+    }
+
+    /// Estimated difficulty rides along with the freshly applied ranking page;
+    /// a failed estimate write must never abort the crawl transaction, so the
+    /// store's pre-mutation validation errors are logged and swallowed.
+    private func persistEstimatedDifficultyObservation(
+        for pageResult: RankingRefreshPageResult,
+        fallbackContext: SearchRankingFailureContext?,
+        in modelContext: ModelContext
+    ) {
+        let payload = EstimatedKeywordDifficultyPayloadFactory.makePayload(
+            estimation: KeywordDifficultyEstimator.estimate(
+                keyword: pageResult.request.term,
+                searchResults: pageResult.page.items
+            ),
+            queryKey: pageResult.request.queryKey,
+            keyword: pageResult.request.term,
+            storefront: pageResult.request.storefront,
+            platform: pageResult.request.platform,
+            requestedResultLimit: SearchRankingCrawl.fullKeywordRankingLimit,
+            providerResultCount: pageResult.page.resultCount,
+            rankingSource: pageResult.page.source,
+            rankingFetchedAt: pageResult.searchedAt,
+            // The estimate is computed synchronously inside the same
+            // transaction that applies the page, so it shares the fetch
+            // timestamp instead of consuming another injected-clock read.
+            computedAt: pageResult.searchedAt,
+            fallbackContext: fallbackContext
+        )
+        do {
+            _ = try EstimatedKeywordDifficultyStore.upsert(payload, in: modelContext)
+        } catch {
+            OpenASOLog.refresh.error(
+                "Estimated difficulty persistence skipped for \(payload.queryKey, privacy: .public): \(String(describing: error), privacy: .public)"
+            )
+        }
     }
 
     func scheduleTopRankingMetadataEnrichment(for pageResult: RankingRefreshPageResult) {
@@ -1631,7 +1676,11 @@ extension SearchRankingPage {
                     : nil
             }
             .prefix(boundedLimit)
-        return SearchRankingPage(items: Array(canonicalItems), source: source)
+        return SearchRankingPage(
+            items: Array(canonicalItems),
+            source: source,
+            fallbackContext: fallbackContext
+        )
     }
 
     private static func canonicalTiePrecedes(

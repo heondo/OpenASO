@@ -182,6 +182,7 @@ final class KeywordWorkspaceModel {
 
             let updatedRow = row.updating(
                 metrics: update.metrics,
+                estimatedDifficulty: update.estimatedDifficulty,
                 refreshStatus: update.refreshStatus,
                 latestSnapshot: update.latestSnapshot,
                 trendSnapshots: update.trendSnapshots,
