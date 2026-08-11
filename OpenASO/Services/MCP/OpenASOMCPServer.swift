@@ -211,6 +211,15 @@ struct OpenASOMCPServerFactory: Sendable {
             )
             return try Self.toolResult(result)
 
+        case "remove_keywords":
+            let result = try await service.removeKeywords(
+                appStoreID: try arguments.requiredInt64("appStoreID"),
+                keywords: try arguments.requiredStringArray("keywords"),
+                storefronts: try arguments.requiredStringArray("storefronts"),
+                platform: arguments.string("platform")
+            )
+            return try Self.toolResult(result)
+
         case "update_keyword_notes":
             let result = try await service.updateKeywordNotes(
                 appStoreID: try arguments.requiredInt64("appStoreID"),
@@ -515,6 +524,10 @@ private extension OpenASOMCPServerFactory {
                 required: ["appStoreID", "keywords", "storefronts"],
                 optional: ["appStoreID": .integer, "keywords": .stringArray, "storefronts": .stringArray, "platform": .string]
             ), readOnly: false, destructive: false, idempotent: true),
+            tool("remove_keywords", "Remove tracked keyword/storefront/platform tracks and skip keywords that are not tracked. Deletes the app's private rank history for each removed track and preserves shared ranking crawls, popularity metrics, and estimated difficulty.", schema(
+                required: ["appStoreID", "keywords", "storefronts"],
+                optional: ["appStoreID": .integer, "keywords": .stringArray, "storefronts": .stringArray, "platform": .string]
+            ), readOnly: false, destructive: true, idempotent: true),
             tool("update_keyword_notes", "Update notes for one tracked keyword.", schema(
                 required: ["appStoreID", "keyword", "storefront", "notes"],
                 optional: ["appStoreID": .integer, "keyword": .string, "storefront": .string, "platform": .string, "notes": .string]

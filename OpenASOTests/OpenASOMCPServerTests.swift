@@ -400,6 +400,90 @@ struct OpenASOMCPServerTests {
     }
 
     @Test
+    func removeKeywordsToolIsDestructiveAndReturnsPersistedRemovalPayload() async throws {
+        let context = try ServerTestContext()
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        let fixtures = try context.insertHistoryFixtures(appStoreID: 123)
+        let server = await OpenASOMCPServerFactory(service: context.service).makeServer()
+        let client = Client(name: "OpenASO MCP Remove Keywords Test Client", version: "1.0")
+        let transports = await InMemoryTransport.createConnectedPair()
+
+        try await server.start(transport: transports.server)
+        defer {
+            Task {
+                await client.disconnect()
+                await server.stop()
+            }
+        }
+
+        _ = try await client.connect(transport: transports.client)
+        let tools = try await client.listTools().tools
+        let removeTool = try #require(tools.first { $0.name == "remove_keywords" })
+        #expect(removeTool.annotations.readOnlyHint == false)
+        #expect(removeTool.annotations.destructiveHint == true)
+        #expect(removeTool.annotations.idempotentHint == true)
+
+        // Case-insensitive match; the payload must echo the persisted term.
+        let removeResult = try await client.callTool(
+            name: "remove_keywords",
+            arguments: [
+                "appStoreID": 123,
+                "keywords": ["Focus Timer"],
+                "storefronts": ["US"],
+                "platform": "iphone",
+            ]
+        )
+        #expect(removeResult.isError == nil)
+        let removeJSON = try #require(removeResult.content.first?.textValue)
+        let removed = try JSONDecoder.openASOMCP.decode(
+            OpenASOMCPRemoveKeywordsResult.self,
+            from: Data(removeJSON.utf8)
+        )
+        #expect(removed.summary.removed == 1)
+        #expect(removed.summary.skipped == 0)
+        let removedKeyword = try #require(removed.removed.first)
+        #expect(removedKeyword.trackIdentityKey == fixtures.trackIdentityKey)
+        #expect(removedKeyword.keyword == "focus timer")
+        #expect(removedKeyword.storefront == "us")
+        #expect(removedKeyword.platform == "iphone")
+        #expect(removedKeyword.queryKey == fixtures.queryKey)
+        #expect(removedKeyword.removedSnapshotCount == fixtures.rankingSnapshotKeys.count)
+        #expect(removedKeyword.removedRankedResultCount == 1)
+
+        // Removing again is a no-op skip rather than an error.
+        let repeatResult = try await client.callTool(
+            name: "remove_keywords",
+            arguments: [
+                "appStoreID": 123,
+                "keywords": ["focus timer"],
+                "storefronts": ["us"],
+            ]
+        )
+        #expect(repeatResult.isError == nil)
+        let repeatJSON = try #require(repeatResult.content.first?.textValue)
+        let repeated = try JSONDecoder.openASOMCP.decode(
+            OpenASOMCPRemoveKeywordsResult.self,
+            from: Data(repeatJSON.utf8)
+        )
+        #expect(repeated.summary.removed == 0)
+        #expect(repeated.removed.isEmpty)
+        #expect(repeated.skipped.map(\.reason) == ["not_tracked"])
+
+        let invalidCalls: [[String: MCP.Value]] = [
+            ["appStoreID": 123, "keywords": ["focus timer"]],
+            ["appStoreID": 123, "storefronts": ["us"]],
+            ["keywords": ["focus timer"], "storefronts": ["us"]],
+            ["appStoreID": 123, "keywords": .string("focus timer"), "storefronts": ["us"]],
+            ["appStoreID": 123, "keywords": .array([]), "storefronts": ["us"]],
+        ]
+        for arguments in invalidCalls {
+            await #expect(throws: MCPError.self) {
+                _ = try await client.callTool(name: "remove_keywords", arguments: arguments)
+            }
+        }
+    }
+
+    @Test
     func controllerStartsLocalHTTPServerAndReturnsInitializeResponse() async throws {
         let context = try ServerTestContext()
         try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")

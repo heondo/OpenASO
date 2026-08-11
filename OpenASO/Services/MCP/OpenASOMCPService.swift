@@ -1487,6 +1487,129 @@ final class OpenASOMCPService: Sendable {
     }
   }
 
+  func removeKeywords(
+    appStoreID: Int64,
+    keywords: [String],
+    storefronts: [String],
+    platform: String? = nil
+  ) async throws -> OpenASOMCPRemoveKeywordsResult {
+    let appStoreID = try OpenASOMCPValidation.appStoreID(appStoreID)
+    let keywords = try OpenASOMCPValidation.keywords(keywords)
+    let storefronts = try OpenASOMCPValidation.storefronts(storefronts)
+    let platform = try OpenASOMCPValidation.platform(platform)
+    guard !storefronts.isEmpty else {
+      throw OpenASOError.providerUnavailable("Select at least one storefront.")
+    }
+
+    return try await backgroundModelStore.write { modelContext in
+      guard let trackedApp = try Self.fetchTrackedApp(appStoreID: appStoreID, in: modelContext)
+      else {
+        throw OpenASOError.appNotFound
+      }
+
+      var skipped: [OpenASOMCPSkippedKeyword] = []
+      var tracksToDelete: [TrackedAppKeyword] = []
+
+      for storefront in storefronts {
+        for keyword in keywords {
+          let identityKey = TrackedAppKeyword.makeIdentityKey(
+            appStoreID: appStoreID,
+            term: keyword,
+            storefront: storefront,
+            platform: platform
+          )
+          guard
+            let track = try Self.fetchTrackedKeyword(identityKey: identityKey, in: modelContext)
+          else {
+            skipped.append(
+              OpenASOMCPSkippedKeyword(
+                keyword: keyword,
+                storefront: storefront,
+                platform: platform.rawValue,
+                reason: "not_tracked"
+              ))
+            continue
+          }
+          tracksToDelete.append(track)
+        }
+      }
+
+      let removedIdentityKeys = tracksToDelete.map(\.identityKey)
+      let tagsByIdentityKey = try TrackedKeywordTagStore.tagsByIdentityKey(
+        for: tracksToDelete,
+        in: modelContext
+      )
+      let rankHistoryCounts = try Self.deleteRankHistory(
+        forTrackIdentityKeys: removedIdentityKeys,
+        in: modelContext
+      )
+      try TrackedKeywordRefreshStatusStore.deleteStatuses(
+        for: removedIdentityKeys,
+        in: modelContext
+      )
+      try TrackedKeywordTagStore.deleteTags(
+        for: removedIdentityKeys,
+        in: modelContext
+      )
+      // Unlike the app- and row-delete UI paths, also delete the refresh
+      // attempt row: it is unique on trackIdentityKey and otherwise only
+      // reconciled on the app's next refresh call, so a keyword re-added
+      // before that reconciliation would inherit the old
+      // lastRankingRefreshAttemptAt and sort to the back of the refresh
+      // rotation.
+      try Self.deleteRankingRefreshAttempts(
+        forTrackIdentityKeys: removedIdentityKeys,
+        in: modelContext
+      )
+
+      // Report the persisted term, storefront, and platform rather than the
+      // caller's spelling: matching is case-insensitive, so an agent that
+      // replays this payload to re-add a keyword must see the display text
+      // the workspace actually stores.
+      let removed = tracksToDelete.map { track in
+        OpenASOMCPRemovedKeyword(
+          id: track.identityKey,
+          trackIdentityKey: track.identityKey,
+          appStoreID: String(track.appStoreID),
+          keyword: track.term,
+          queryKey: track.queryKey,
+          storefront: track.storefront,
+          platform: track.platform.rawValue,
+          removedSnapshotCount: rankHistoryCounts[track.identityKey]?.snapshots ?? 0,
+          removedRankedResultCount: rankHistoryCounts[track.identityKey]?.rankedResults ?? 0,
+          removedTagCount: tagsByIdentityKey[track.identityKey]?.count ?? 0,
+          createdAt: track.createdAt
+        )
+      }
+
+      // AppKeywordStats (appStoreID::queryKey) is intentionally left behind:
+      // it is write-only derived data rebuilt from crawls, with no reader
+      // anywhere in the app or MCP surface, and the existing UI delete paths
+      // leave the same residue. Revisit if it is ever surfaced app-scoped.
+      for track in tracksToDelete {
+        trackedApp.keywordTracks.removeAll { $0.identityKey == track.identityKey }
+        modelContext.delete(track)
+      }
+
+      return OpenASOMCPRemoveKeywordsResult(
+        summary: OpenASOMCPMutationSummary(
+          inserted: 0,
+          updated: 0,
+          skipped: skipped.count,
+          refreshed: 0,
+          failed: 0,
+          removed: removed.count
+        ),
+        removed: removed,
+        skipped: skipped,
+        notes: [
+          "Removed tracks delete this app's stored rank history for the keyword; shared ranking crawls, popularity metrics, and estimated difficulty are preserved for other apps and for re-adding the keyword.",
+          "Removal matches the storefront and platform you passed; platform defaults to iphone, so a keyword tracked on another platform is reported as not_tracked.",
+        ]
+      )
+    }
+  }
+
   func updateKeywordNotes(
     appStoreID: Int64,
     keyword: String,
@@ -4830,6 +4953,71 @@ extension OpenASOMCPService {
     )
     descriptor.fetchLimit = 1
     return try modelContext.fetch(descriptor).first
+  }
+
+  fileprivate static func deleteRankingRefreshAttempts(
+    forTrackIdentityKeys trackIdentityKeys: [String],
+    in modelContext: ModelContext
+  ) throws {
+    let identityKeys = Array(Set(trackIdentityKeys))
+    guard !identityKeys.isEmpty else { return }
+
+    let descriptor = FetchDescriptor<TrackedAppKeywordRefreshAttempt>(
+      predicate: #Predicate { attempt in
+        identityKeys.contains(attempt.trackIdentityKey)
+      }
+    )
+    for attempt in try modelContext.fetch(descriptor) {
+      modelContext.delete(attempt)
+    }
+  }
+
+  /// Deletes a track's rank history and reports what went with it.
+  ///
+  /// Sweeps by `trackIdentityKey`/`snapshotKey` instead of walking
+  /// `track.snapshots`: no `deleteRule` cascades from a track to its snapshots
+  /// or ranked results, so the UI delete paths leave rows behind that the
+  /// relationship no longer reaches. `persistRankingPage` reuses whatever row
+  /// already sits at a snapshot's deterministic `snapshotKey`, so an orphan
+  /// left by an earlier delete would swallow the next same-UTC-day refresh of
+  /// a re-added keyword and strand its rank.
+  fileprivate static func deleteRankHistory(
+    forTrackIdentityKeys trackIdentityKeys: [String],
+    in modelContext: ModelContext
+  ) throws -> [String: (snapshots: Int, rankedResults: Int)] {
+    let identityKeys = Array(Set(trackIdentityKeys))
+    guard !identityKeys.isEmpty else { return [:] }
+
+    let snapshots = try modelContext.fetch(
+      FetchDescriptor<TrackedKeywordDailyRanking>(
+        predicate: #Predicate { snapshot in
+          identityKeys.contains(snapshot.trackIdentityKey)
+        }
+      ))
+    let snapshotKeys = snapshots.map(\.snapshotKey)
+    let rankedResults = try modelContext.fetch(
+      FetchDescriptor<TrackedKeywordRankedResult>(
+        predicate: #Predicate { result in
+          snapshotKeys.contains(result.snapshotKey)
+        }
+      ))
+
+    var counts: [String: (snapshots: Int, rankedResults: Int)] = [:]
+    var identityKeyBySnapshotKey: [String: String] = [:]
+    for snapshot in snapshots {
+      identityKeyBySnapshotKey[snapshot.snapshotKey] = snapshot.trackIdentityKey
+      counts[snapshot.trackIdentityKey, default: (0, 0)].snapshots += 1
+    }
+    for result in rankedResults {
+      if let identityKey = identityKeyBySnapshotKey[result.snapshotKey] {
+        counts[identityKey, default: (0, 0)].rankedResults += 1
+      }
+      modelContext.delete(result)
+    }
+    for snapshot in snapshots {
+      modelContext.delete(snapshot)
+    }
+    return counts
   }
 
   @discardableResult

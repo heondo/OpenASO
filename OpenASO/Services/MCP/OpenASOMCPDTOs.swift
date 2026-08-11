@@ -338,6 +338,27 @@ struct OpenASOMCPSkippedKeyword: Codable, Sendable, Equatable {
     let reason: String
 }
 
+struct OpenASOMCPRemoveKeywordsResult: Codable, Sendable {
+    let summary: OpenASOMCPMutationSummary
+    let removed: [OpenASOMCPRemovedKeyword]
+    let skipped: [OpenASOMCPSkippedKeyword]
+    let notes: [String]
+}
+
+struct OpenASOMCPRemovedKeyword: Codable, Identifiable, Sendable, Equatable {
+    let id: String
+    let trackIdentityKey: String
+    let appStoreID: String
+    let keyword: String
+    let queryKey: String
+    let storefront: String
+    let platform: String
+    let removedSnapshotCount: Int
+    let removedRankedResultCount: Int
+    let removedTagCount: Int
+    let createdAt: Date
+}
+
 struct OpenASOMCPKeywordNotesResult: Codable, Sendable {
     let track: OpenASOMCPKeywordSummary
     let summary: OpenASOMCPMutationSummary

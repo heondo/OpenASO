@@ -83,6 +83,414 @@ struct OpenASOMCPServiceTests {
     }
 
     @Test
+    func removeKeywordsDeletesTracksAndSkipsUntracked() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["focus timer", "pomodoro"],
+            storefronts: ["us", "gb"],
+            platform: "iphone"
+        )
+
+        let result = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["Focus Timer", "pomodoro", "not tracked"],
+            storefronts: ["US", "fr"],
+            platform: "iphone"
+        )
+
+        #expect(result.summary.removed == 2)
+        #expect(result.summary.skipped == 4)
+        #expect(Set(result.removed.map(\.keyword)) == ["focus timer", "pomodoro"])
+        #expect(result.removed.allSatisfy { $0.storefront == "us" })
+        #expect(
+            result.skipped.sorted(by: { "\($0.storefront)::\($0.keyword)" < "\($1.storefront)::\($1.keyword)" }) ==
+            [
+                OpenASOMCPSkippedKeyword(keyword: "Focus Timer", storefront: "fr", platform: "iphone", reason: "not_tracked"),
+                OpenASOMCPSkippedKeyword(keyword: "not tracked", storefront: "fr", platform: "iphone", reason: "not_tracked"),
+                OpenASOMCPSkippedKeyword(keyword: "pomodoro", storefront: "fr", platform: "iphone", reason: "not_tracked"),
+                OpenASOMCPSkippedKeyword(keyword: "not tracked", storefront: "us", platform: "iphone", reason: "not_tracked"),
+            ].sorted(by: { "\($0.storefront)::\($0.keyword)" < "\($1.storefront)::\($1.keyword)" })
+        )
+
+        let remaining = try await service.listKeywords(appStoreID: 123)
+        #expect(Set(remaining.items.map { "\($0.keyword)::\($0.storefront)" }) == ["focus timer::gb", "pomodoro::gb"])
+    }
+
+    @Test
+    func removeKeywordsDeletesRankHistoryTagsAndStatusButPreservesSharedRecords() async throws {
+        let rankingProvider = StubMCPRankingProvider(pages: [
+            "calorie tracker::us::iphone": SearchRankingPage(items: [
+                makeRankingItem(position: 1, appStoreID: 456, name: "MyFitnessPal", ratingCount: 1_000),
+                makeRankingItem(position: 2, appStoreID: 123, name: "Cal AI", ratingCount: 100)
+            ], source: .iTunesFallback)
+        ])
+        let context = try MCPTestContext(rankingProvider: rankingProvider)
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Cal AI")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        _ = try await service.refreshKeywordRankings(
+            appStoreID: 123,
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        let track = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).first)
+        let identityKey = track.identityKey
+        let queryKey = track.queryKey
+        try TrackedKeywordTagStore.setTags(["brand"], for: track, in: context.modelContext)
+        try context.modelContext.save()
+
+        let snapshotsBefore = try context.modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>())
+        #expect(!snapshotsBefore.isEmpty)
+        let rankedResultsBefore = try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRankedResult>())
+        #expect(!rankedResultsBefore.isEmpty)
+        let crawlsBefore = try context.modelContext.fetch(FetchDescriptor<KeywordRankingCrawl>())
+        #expect(!crawlsBefore.isEmpty)
+
+        let result = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        #expect(result.summary.removed == 1)
+        let removedKeyword = try #require(result.removed.first)
+        #expect(removedKeyword.trackIdentityKey == identityKey)
+        #expect(removedKeyword.removedSnapshotCount == snapshotsBefore.count)
+        #expect(removedKeyword.removedRankedResultCount == rankedResultsBefore.count)
+        #expect(removedKeyword.removedTagCount == 1)
+
+        // Track and its private rank history are gone.
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>(
+            predicate: #Predicate { $0.trackIdentityKey == identityKey }
+        )).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRankedResult>()).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>(
+            predicate: #Predicate { $0.trackIdentityKey == identityKey }
+        )).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRefreshStatus>(
+            predicate: #Predicate { $0.trackIdentityKey == identityKey }
+        )).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedAppKeywordRefreshAttempt>(
+            predicate: #Predicate { $0.trackIdentityKey == identityKey }
+        )).isEmpty)
+
+        // Shared, query-scoped records survive the removal.
+        #expect(try context.modelContext.fetch(FetchDescriptor<KeywordQuery>(
+            predicate: #Predicate { $0.queryKey == queryKey }
+        )).count == 1)
+        #expect(try context.modelContext.fetch(FetchDescriptor<KeywordRankingCrawl>()).count == crawlsBefore.count)
+    }
+
+    @Test
+    func removeKeywordsRejectsUnknownAppAndEmptyStorefronts() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        await #expect(throws: OpenASOError.appNotFound) {
+            _ = try await service.removeKeywords(
+                appStoreID: 999,
+                keywords: ["pomodoro"],
+                storefronts: ["us"],
+                platform: "iphone"
+            )
+        }
+
+        await #expect(throws: OpenASOError.providerUnavailable("Select at least one storefront.")) {
+            _ = try await service.removeKeywords(
+                appStoreID: 123,
+                keywords: ["pomodoro"],
+                storefronts: [],
+                platform: "iphone"
+            )
+        }
+
+        await #expect(throws: OpenASOError.providerUnavailable("Unsupported platform 'android'.")) {
+            _ = try await service.removeKeywords(
+                appStoreID: 123,
+                keywords: ["pomodoro"],
+                storefronts: ["us"],
+                platform: "android"
+            )
+        }
+
+        await #expect(throws: OpenASOError.invalidAppStoreID) {
+            _ = try await service.removeKeywords(
+                appStoreID: 0,
+                keywords: ["pomodoro"],
+                storefronts: ["us"],
+                platform: "iphone"
+            )
+        }
+
+        // None of the rejected calls should have mutated anything.
+        let listed = try await service.listKeywords(appStoreID: 123)
+        #expect(listed.items.map(\.keyword) == ["pomodoro"])
+    }
+
+    @Test
+    func removeKeywordsWithEmptyKeywordsIsNoop() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        let result = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: [],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        #expect(result.summary.removed == 0)
+        #expect(result.summary.skipped == 0)
+        #expect(result.removed.isEmpty)
+        #expect(result.skipped.isEmpty)
+        let listed = try await service.listKeywords(appStoreID: 123)
+        #expect(listed.items.map(\.keyword) == ["pomodoro"])
+    }
+
+    @Test
+    func removeKeywordsIsScopedByStorefrontAndPlatform() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        // Wrong storefront: reported not_tracked, original track untouched.
+        let wrongStorefront = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["gb"],
+            platform: "iphone"
+        )
+        #expect(wrongStorefront.summary.removed == 0)
+        #expect(wrongStorefront.skipped == [
+            OpenASOMCPSkippedKeyword(keyword: "pomodoro", storefront: "gb", platform: "iphone", reason: "not_tracked")
+        ])
+
+        // Wrong platform (default is iphone; the track was never tracked on ipad).
+        let wrongPlatform = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "ipad"
+        )
+        #expect(wrongPlatform.summary.removed == 0)
+        #expect(wrongPlatform.skipped == [
+            OpenASOMCPSkippedKeyword(keyword: "pomodoro", storefront: "us", platform: "ipad", reason: "not_tracked")
+        ])
+
+        let stillTracked = try await service.listKeywords(appStoreID: 123)
+        #expect(stillTracked.items.map(\.keyword) == ["pomodoro"])
+
+        // Correct storefront and platform actually removes it.
+        let removed = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        #expect(removed.summary.removed == 1)
+        let afterRemoval = try await service.listKeywords(appStoreID: 123)
+        #expect(afterRemoval.items.isEmpty)
+    }
+
+    @Test
+    func removeKeywordsAllowsReAddingAfterRemoval() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Focus Timer")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        let originalTrack = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).first)
+        let originalIdentityKey = originalTrack.identityKey
+        try TrackedKeywordTagStore.setTags(["brand"], for: originalTrack, in: context.modelContext)
+        try TrackedKeywordRefreshStatusStore.set(
+            "Ranking refresh failed.",
+            domain: .ranking,
+            for: originalTrack,
+            in: context.modelContext
+        )
+        try context.modelContext.save()
+
+        let removed = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        #expect(removed.summary.removed == 1)
+
+        let readded = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["pomodoro"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        #expect(readded.summary.inserted == 1)
+        #expect(readded.summary.skipped == 0)
+
+        let newTrack = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).first)
+        #expect(newTrack.identityKey == originalIdentityKey)
+        // Assert the records themselves are gone, not just the generation-guarded
+        // reads: both stores treat another `trackCreatedAt` as absent, so a
+        // re-added track reads clean whether or not the old rows were deleted.
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>(
+            predicate: #Predicate { $0.trackIdentityKey == originalIdentityKey }
+        )).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRefreshStatus>(
+            predicate: #Predicate { $0.trackIdentityKey == originalIdentityKey }
+        )).isEmpty)
+        #expect(try TrackedKeywordRefreshStatusStore.snapshot(
+            for: newTrack,
+            in: context.modelContext
+        ) == .empty)
+        #expect(try TrackedKeywordTagStore.tags(for: newTrack, in: context.modelContext).isEmpty)
+    }
+
+    @Test
+    func removeKeywordsSweepsRankHistoryOrphanedByAUIStyleTrackDelete() async throws {
+        let rankingProvider = StubMCPRankingProvider(pages: [
+            "calorie tracker::us::iphone": SearchRankingPage(items: [
+                makeRankingItem(position: 1, appStoreID: 456, name: "MyFitnessPal", ratingCount: 1_000),
+                makeRankingItem(position: 2, appStoreID: 123, name: "Cal AI", ratingCount: 100)
+            ], source: .iTunesFallback)
+        ])
+        let context = try MCPTestContext(rankingProvider: rankingProvider)
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Cal AI")
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        _ = try await service.refreshKeywordRankings(
+            appStoreID: 123,
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        let track = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).first)
+        let identityKey = track.identityKey
+        let snapshotCount = try context.modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>()).count
+        let rankedResultCount = try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRankedResult>()).count
+        #expect(snapshotCount > 0)
+        #expect(rankedResultCount > 0)
+
+        // Reproduce what the UI delete paths leave behind: the track goes away
+        // without its snapshots, which no `deleteRule` cascades to.
+        context.modelContext.delete(track)
+        try context.modelContext.save()
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>()).count == snapshotCount)
+
+        _ = try await service.addKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        let readdedTrack = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>()).first)
+        #expect(readdedTrack.identityKey == identityKey)
+        #expect(readdedTrack.snapshots.isEmpty)
+
+        let result = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+
+        // The orphaned rows are swept by identity key and counted, even though
+        // the re-added track's relationship never reached them.
+        let removedKeyword = try #require(result.removed.first)
+        #expect(removedKeyword.removedSnapshotCount == snapshotCount)
+        #expect(removedKeyword.removedRankedResultCount == rankedResultCount)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordDailyRanking>(
+            predicate: #Predicate { $0.trackIdentityKey == identityKey }
+        )).isEmpty)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRankedResult>()).isEmpty)
+    }
+
+    @Test
+    func removeKeywordsLeavesAnotherAppsTrackForTheSameKeywordIntact() async throws {
+        let context = try MCPTestContext()
+        let service = context.service
+        try context.insertTrackedApp(appStoreID: 123, name: "Cal AI")
+        try context.insertTrackedApp(appStoreID: 456, name: "MyFitnessPal")
+        for appStoreID in [Int64(123), Int64(456)] {
+            _ = try await service.addKeywords(
+                appStoreID: appStoreID,
+                keywords: ["calorie tracker"],
+                storefronts: ["us"],
+                platform: "iphone"
+            )
+        }
+        let otherTrack = try #require(context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>(
+            predicate: #Predicate { $0.appStoreID == 456 }
+        )).first)
+        let otherIdentityKey = otherTrack.identityKey
+        try TrackedKeywordTagStore.setTags(["brand"], for: otherTrack, in: context.modelContext)
+        try TrackedKeywordRefreshStatusStore.set(
+            "Ranking refresh failed.",
+            domain: .ranking,
+            for: otherTrack,
+            in: context.modelContext
+        )
+        try context.modelContext.save()
+
+        let result = try await service.removeKeywords(
+            appStoreID: 123,
+            keywords: ["calorie tracker"],
+            storefronts: ["us"],
+            platform: "iphone"
+        )
+        #expect(result.summary.removed == 1)
+
+        // Both tracks share a queryKey; only the requested app's track goes.
+        let remaining = try context.modelContext.fetch(FetchDescriptor<TrackedAppKeyword>())
+        #expect(remaining.map(\.identityKey) == [otherIdentityKey])
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordTagRecord>(
+            predicate: #Predicate { $0.trackIdentityKey == otherIdentityKey }
+        )).count == 1)
+        #expect(try context.modelContext.fetch(FetchDescriptor<TrackedKeywordRefreshStatus>(
+            predicate: #Predicate { $0.trackIdentityKey == otherIdentityKey }
+        )).count == 1)
+        let otherKeywords = try await service.listKeywords(appStoreID: 456)
+        #expect(otherKeywords.items.map(\.keyword) == ["calorie tracker"])
+    }
+
+    @Test
     func updateKeywordTagsSetsReplacesAndClears() async throws {
         let context = try MCPTestContext()
         let service = context.service
