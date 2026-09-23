@@ -2,7 +2,28 @@ import Foundation
 import SwiftData
 import SwiftUI
 
+/// Process entry point.
+///
+/// The headless modes (`--mcp-stdio`, `--daily-refresh-once`) branch off here, before SwiftUI's
+/// `App.main` creates `NSApplication`. Touching `NSApplication.shared` checks the process in with
+/// LaunchServices as the running instance of the app's bundle identifier, so while a headless
+/// process was alive (an agent's MCP connection, or a 30-minute background refresh) clicking
+/// OpenASO in Finder or the Dock only "activated" that windowless process and the app never opened.
 @main
+@MainActor
+enum OpenASOEntryPoint {
+    static func main() {
+        switch OpenASOExecutionMode(arguments: ProcessInfo.processInfo.arguments) {
+        case .backgroundRefresh:
+            OpenASOApp.runBackgroundRefreshAndExit()
+        case .mcpStdio:
+            OpenASOApp.runHeadlessMCPStdioAndExit()
+        case .graphical:
+            OpenASOApp.main()
+        }
+    }
+}
+
 struct OpenASOApp: App {
     private let updaterController: SparkleUpdaterController?
     @State private var launchAlert: AppLaunchAlertContext?
@@ -13,27 +34,12 @@ struct OpenASOApp: App {
         let executionMode = OpenASOExecutionMode(
             arguments: ProcessInfo.processInfo.arguments
         )
+        // Headless modes never reach this initializer; `OpenASOEntryPoint` routes them first.
         updaterController = executionMode == .graphical
             ? SparkleUpdaterController(startingUpdater: true)
             : nil
-        if executionMode.suppressesApplicationUI {
-            _ = NSApplication.shared.setActivationPolicy(.prohibited)
-        }
-
-        if executionMode == .backgroundRefresh {
-            Self.runBackgroundRefreshAndExit()
-        }
 
         let startupState = Self.makeStartupState()
-        if executionMode == .mcpStdio {
-            switch startupState {
-            case .ready(_, let services):
-                Self.runMCPStdioAndExit(serverProvider: services.mcpServerProvider)
-            case .storeUnavailable(let error):
-                Self.exitMCPStdio(with: error.diagnosticReport)
-            }
-        }
-
         self.startupState = startupState
         _launchAlert = State(initialValue: nil)
 
@@ -65,7 +71,16 @@ struct OpenASOApp: App {
         }
     }
 
-    private static func runBackgroundRefreshAndExit() -> Never {
+    static func runHeadlessMCPStdioAndExit() -> Never {
+        switch makeStartupState() {
+        case .ready(_, let services):
+            runMCPStdioAndExit(serverProvider: services.mcpServerProvider)
+        case .storeUnavailable(let error):
+            exitMCPStdio(with: error.diagnosticReport)
+        }
+    }
+
+    static func runBackgroundRefreshAndExit() -> Never {
         let phaseStore = OneShotWatchdogPhaseStore()
         let watchdog = OneShotProcessWatchdog()
         let logFile = OneShotRefreshLogFile.live()
