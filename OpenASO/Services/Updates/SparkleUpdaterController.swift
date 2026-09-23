@@ -5,9 +5,9 @@ import Sparkle
 final class SparkleUpdaterController {
     private let updaterController: SPUStandardUpdaterController
 
-    init() {
+    init(startingUpdater: Bool = false) {
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: startingUpdater,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )

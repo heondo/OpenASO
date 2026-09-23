@@ -7,6 +7,54 @@ import Testing
 @Suite(.timeLimit(.minutes(1)))
 struct DailyRefreshSchedulerTests {
     @Test
+    func threeHundredMinutesMeansFiveAMOncePerDay() {
+        let calendar = utcCalendar()
+        let configuration = DailyRefreshScheduleConfiguration(
+            isAutomaticRefreshEnabled: true,
+            refreshTimeMinutes: 300
+        )
+        let before = date(
+            year: 2026,
+            month: 1,
+            day: 2,
+            hour: 4,
+            minute: 59,
+            calendar: calendar
+        )
+        let fiveAM = date(
+            year: 2026,
+            month: 1,
+            day: 2,
+            hour: 5,
+            calendar: calendar
+        )
+
+        let beforeDecision = DailyRefreshDuePolicy.evaluate(
+            configuration: configuration,
+            lastClaimedAt: nil,
+            now: before,
+            calendar: calendar
+        )
+        let dueDecision = DailyRefreshDuePolicy.evaluate(
+            configuration: configuration,
+            lastClaimedAt: nil,
+            now: fiveAM,
+            calendar: calendar
+        )
+        let claimedDecision = DailyRefreshDuePolicy.evaluate(
+            configuration: configuration,
+            lastClaimedAt: fiveAM,
+            now: fiveAM.addingTimeInterval(5 * 60 * 60),
+            calendar: calendar
+        )
+
+        #expect(beforeDecision.nextCheckAt == fiveAM)
+        #expect(dueDecision.dueSlot?.scheduledFor == fiveAM)
+        #expect(claimedDecision.dueSlot == nil)
+        #expect(claimedDecision.nextCheckAt == fiveAM.addingTimeInterval(24 * 60 * 60))
+    }
+
+    @Test
     func disabledPolicyHasNoDueSlotOrWakeDate() {
         let calendar = utcCalendar()
         let now = date(

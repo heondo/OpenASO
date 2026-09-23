@@ -330,7 +330,7 @@ private struct KeywordDataUpdateListener: View {
                         using: services.backgroundModelStore,
                         fallbackModelContext: modelContext
                     )
-                    workspaceModel.applyUpdatedRows(updatedRows)
+                    await workspaceModel.applyUpdatedRows(updatedRows)
                 } catch is CancellationError {
                     return
                 } catch {

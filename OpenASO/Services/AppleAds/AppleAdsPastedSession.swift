@@ -20,22 +20,29 @@ enum AppleAdsPastedSession {
             throw OpenASOError.providerUnavailable("No cookies found in the pasted text. \(instructions)")
         }
 
-        guard let xsrfToken = cookies.first(where: { $0.name == AppleAdsSessionCookies.xsrfToken })?.value else {
-            throw OpenASOError.providerUnavailable(
-                "The pasted cookies are missing \(AppleAdsSessionCookies.xsrfToken). Copy them from an Apple Ads page you are signed in to."
-            )
-        }
-
         guard cookies.contains(where: { $0.name == AppleAdsSessionCookies.session }) else {
             throw OpenASOError.providerUnavailable(
                 "The pasted cookies are missing \(AppleAdsSessionCookies.session). Copy them from an Apple Ads page you are signed in to."
             )
         }
 
+        let xsrfToken = cookies.first(where: { $0.name == AppleAdsSessionCookies.xsrfToken })?.value ?? ""
+        let hasAuthenticatedSession = cookies.contains {
+            $0.name == AppleAdsSessionCookies.authenticatedSession
+        }
+        guard !xsrfToken.isEmpty || hasAuthenticatedSession else {
+            throw OpenASOError.providerUnavailable(
+                "The pasted cookies are missing both \(AppleAdsSessionCookies.xsrfToken) and \(AppleAdsSessionCookies.authenticatedSession). Copy them from an Apple Ads page you are signed in to."
+            )
+        }
+
         return AppleAdsWebSession(
             cookieHeader: cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "),
             xsrfToken: xsrfToken,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            // `document.cookie` drops every attribute, so these land as host cookies. Apple's own
+            // `Set-Cookie` responses refine them the first time the session is used.
+            cookies: cookies.map { AppleAdsCookie(name: $0.name, value: $0.value) }
         )
     }
 

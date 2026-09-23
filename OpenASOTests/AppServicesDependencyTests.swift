@@ -7,6 +7,47 @@ import Testing
 @MainActor
 struct AppServicesDependencyTests {
     @Test
+    func backgroundFactoryUsesOnlySuppliedDefaultsNamespaceKeychainAndTransport() throws {
+        let defaults = Self.makeDefaults()
+        AppSettingsStore(defaults: defaults).saveRefreshTime(hour: 8, minute: 45)
+        let namespace = AppNamespace(
+            bundleIdentifier: "com.thirdtech.openaso.tests.background.\(UUID().uuidString)"
+        )
+        KeychainItemPresenceStore(defaults: defaults).markPresent(
+            service: namespace.keychainService("apple-ads"),
+            account: "private-key"
+        )
+        let keychain = RecordingKeychainService()
+        var transportRequestCount = 0
+        let transport = MockHTTPClient { request in
+            transportRequestCount += 1
+            Issue.record("Background service construction unexpectedly requested \(request.url?.absoluteString ?? "an unknown URL")")
+            throw URLError(.unsupportedURL)
+        }
+        let container = try ModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
+
+        let services = AppServices.backgroundRefresh(
+            defaults: defaults,
+            namespace: namespace,
+            keychain: keychain,
+            httpClient: transport,
+            modelContainer: container
+        )
+
+        #expect(services.settingsStore.refreshHour == 8)
+        #expect(services.settingsStore.refreshMinute == 45)
+        #expect(services.backgroundModelStore != nil)
+        #expect(keychain.dataRequests.map(\.service).contains(
+            namespace.keychainService("apple-ads")
+        ))
+        #expect(keychain.dataRequests.allSatisfy {
+            $0.service.hasPrefix(namespace.keychainServicePrefix)
+        })
+        #expect(transportRequestCount == 0)
+        #expect(!services.appleAdsCredentialStore.hasWebLoginCredentials)
+    }
+
+    @Test
     func modelContainerFactoryUsesAppendOnlyV6MigrationPlan() throws {
         let container = try ModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
 
@@ -208,7 +249,12 @@ struct AppServicesDependencyTests {
                     .queryItems?.first(where: { $0.name == "adamId" })?.value
                     == String(contextAppStoreID)
             )
-            #expect(request.value(forHTTPHeaderField: "Cookie") == initialSession.cookieHeader)
+            // The jar builds the header now, so compare against what it produces rather than the
+            // order the fixture happened to write the cookies in.
+            #expect(
+                request.value(forHTTPHeaderField: "Cookie")
+                    == AppleAdsCookieJar(cookies: initialSession.jarCookies).cookieHeader(for: url)
+            )
             #expect(
                 request.value(forHTTPHeaderField: "X-XSRF-TOKEN-CM")
                     == initialSession.xsrfToken
@@ -1178,7 +1224,8 @@ struct AppServicesDependencyTests {
         }
 
         let session = AppleAdsWebSession(cookieHeader: "cookie=value; XSRF-TOKEN-CM=token", xsrfToken: "token", updatedAt: .now)
-        let popularities = try await AppleAdsCMPopularityClient(httpClient: client).keywordPopularities(
+        let cookieJar = AppleAdsCookieJar(cookies: session.jarCookies)
+        let popularities = try await AppleAdsCMPopularityClient(httpClient: client, cookieJar: cookieJar).keywordPopularities(
             for: (1 ... 101).map { "term \($0)" },
             storefrontCode: "us",
             adamId: 123_456_789,
@@ -1189,7 +1236,8 @@ struct AppServicesDependencyTests {
         #expect(requestBodies.allSatisfy { $0.storefronts == ["US"] })
         #expect(requestHeaders["Accept"] == "application/json")
         #expect(requestHeaders["Content-Type"] == "application/json")
-        #expect(requestHeaders["Cookie"] == "cookie=value; XSRF-TOKEN-CM=token")
+        // The jar owns the header now, so it comes back in the jar's stable name order.
+        #expect(requestHeaders["Cookie"] == "XSRF-TOKEN-CM=token; cookie=value")
         #expect(requestHeaders["Origin"] == "https://app-ads.apple.com")
         #expect(requestHeaders["Referer"] == "https://app-ads.apple.com/")
         #expect(requestHeaders["User-Agent"]?.contains("Mozilla/5.0") == true)
@@ -1332,15 +1380,19 @@ struct AppServicesDependencyTests {
     }
 
     private func cmPopularities(using client: HTTPClient) async throws -> [String: Int] {
-        try await AppleAdsCMPopularityClient(httpClient: client).keywordPopularities(
+        let session = AppleAdsWebSession(
+            cookieHeader: "cookie=value; XSRF-TOKEN-CM=token",
+            xsrfToken: "token",
+            updatedAt: .now
+        )
+        return try await AppleAdsCMPopularityClient(
+            httpClient: client,
+            cookieJar: AppleAdsCookieJar(cookies: session.jarCookies)
+        ).keywordPopularities(
             for: ["focus"],
             storefrontCode: "us",
             adamId: 123_456_789,
-            session: AppleAdsWebSession(
-                cookieHeader: "cookie=value; XSRF-TOKEN-CM=token",
-                xsrfToken: "token",
-                updatedAt: .now
-            )
+            session: session
         )
     }
 

@@ -910,6 +910,10 @@ struct HeadlessRefreshServiceTests {
         for (metadataStatus, metadataDisposition) in metadataCases {
             for (detailDisposition, detailResult) in detailCases {
                 let result = HeadlessRefreshAppResultAdapter.map(
+                    metadataResult: makeMetadataResult(
+                        appStoreID: plan.appStoreID,
+                        status: metadataStatus
+                    ),
                     metadataStatus: metadataStatus,
                     detailResult: detailResult,
                     request: plan.appDetailRequest
@@ -926,8 +930,76 @@ struct HeadlessRefreshServiceTests {
 
                 #expect(result.disposition == expectedDisposition)
                 #expect((result.issue == nil) == (expectedDisposition == .success))
+                let expectedMetadataDiagnosticCount = switch metadataStatus {
+                case .succeeded: 0
+                case .partial: 1
+                case .failed: 2
+                }
+                let expectedDetailDiagnosticCount = switch detailDisposition {
+                case .success: 0
+                case .partialFailure, .failure: 1
+                }
+                #expect(result.diagnostics.count
+                    == expectedMetadataDiagnosticCount + expectedDetailDiagnosticCount)
             }
         }
+    }
+
+    @Test
+    func cadenceOperationalMetricsFailureProducesExactSingleAppPartialCounts() async {
+        let appStoreID: Int64 = 6_761_003_558
+        let plan = makeAppPlan(
+            appStoreID: appStoreID,
+            refreshRatingsAndReviews: false
+        )
+        let detail = AppDetailRefreshResult(
+            keywordOutcomes: [
+                KeywordBackgroundRefreshOutcome(trackIdentityKey: "cadence/us", error: nil),
+            ],
+            ratingOutcomes: [],
+            reviewOutcomes: [],
+            firstError: .providerUnavailable("raw provider detail must not persist"),
+            metricsDiagnostics: [
+                AppDetailMetricsDiagnostic(
+                    code: .providerFailure,
+                    failureCount: 1,
+                    skippedCount: 0
+                ),
+            ]
+        )
+        let appResult = HeadlessRefreshAppResultAdapter.map(
+            metadataResult: makeMetadataResult(appStoreID: appStoreID, status: .succeeded),
+            metadataStatus: .succeeded,
+            detailResult: detail,
+            request: plan.appDetailRequest
+        )
+        let instant = Date(timeIntervalSince1970: 1_000)
+        let request = HeadlessRefreshRunRequest(
+            scheduledFor: instant,
+            refreshRatingsAndReviews: false
+        )
+        let service = HeadlessRefreshService(dependencies: HeadlessRefreshDependencies(
+            loadPlan: { _ in HeadlessRefreshPlan(apps: [plan]) },
+            refreshApp: { _ in appResult },
+            now: { instant }
+        ))
+
+        let summary = await service.run(request)
+
+        #expect(summary.disposition == .partialFailure)
+        #expect(summary.plannedAppCount == 1)
+        #expect(summary.completedAppCount == 1)
+        #expect(summary.successfulAppCount == 0)
+        #expect(summary.partialFailureAppCount == 1)
+        #expect(summary.failedAppCount == 0)
+        #expect(summary.diagnostics == [HeadlessRefreshDiagnostic(
+            appStoreID: appStoreID,
+            stage: .keywordMetrics,
+            provider: .appleAdsWeb,
+            severity: .failure,
+            reasonCode: .stageFailed
+        )])
+        #expect(!summary.diagnostics.map(\.safeMessage).joined().contains("raw provider detail"))
     }
 
     @Test
@@ -1026,6 +1098,8 @@ struct HeadlessRefreshServiceTests {
 
         #expect(await metadataFailureCalls.values() == ["metadata", "detail"])
         #expect(metadataFailureResult.disposition == .partialFailure)
+        #expect(metadataFailureResult.diagnostics.map(\.stage) == [.metadata])
+        #expect(metadataFailureResult.diagnostics.map(\.provider) == [.internalService])
 
         let detailFailureCalls = HeadlessAppAdapterCallRecorder()
         let detailFailureAdapter = HeadlessRefreshAppAdapter(
@@ -1046,6 +1120,7 @@ struct HeadlessRefreshServiceTests {
 
         #expect(await detailFailureCalls.values() == ["metadata", "detail"])
         #expect(detailFailureResult.disposition == .partialFailure)
+        #expect(detailFailureResult.diagnostics.map(\.stage) == [.setup])
 
         let totalFailureAdapter = HeadlessRefreshAppAdapter(
             refreshMetadata: { _ in throw HeadlessAppAdapterTestError.expected },
@@ -1053,6 +1128,7 @@ struct HeadlessRefreshServiceTests {
         )
         let totalFailureResult = try await totalFailureAdapter.refresh(plan)
         #expect(totalFailureResult.disposition == .failure)
+        #expect(totalFailureResult.diagnostics.map(\.stage) == [.metadata, .setup])
     }
 
     @Test

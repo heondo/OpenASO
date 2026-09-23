@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import OSLog
 import Security
 
@@ -24,6 +25,15 @@ enum KeychainReadResult: Equatable, Sendable {
     case failure(KeychainReadFailure)
 }
 
+enum KeychainInteractionPolicy: Equatable, Sendable {
+    case interactive
+    case noninteractive
+}
+
+enum KeychainOperationError: Error, Equatable, Sendable {
+    case status(OSStatus)
+}
+
 protocol KeychainService {
     func readData(service: String, account: String) -> KeychainReadResult
     func save(_ data: Data, service: String, account: String) throws
@@ -41,22 +51,43 @@ extension KeychainService {
 
 struct SystemKeychainService: KeychainService {
     typealias CopyMatching = (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    typealias Update = (CFDictionary, CFDictionary) -> OSStatus
+    typealias Add = (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    typealias Delete = (CFDictionary) -> OSStatus
     typealias ReadFailureReporter = (KeychainReadFailure) -> Void
 
     private static let logger = Logger(subsystem: OpenASOLog.subsystem, category: "keychain")
 
     private let copyMatching: CopyMatching
+    private let update: Update
+    private let add: Add
+    private let delete: Delete
     private let reportReadFailure: ReadFailureReporter
+    private let interactionPolicy: KeychainInteractionPolicy
 
     init(
+        interactionPolicy: KeychainInteractionPolicy = .interactive,
         copyMatching: @escaping CopyMatching = { query, result in
             SecItemCopyMatching(query, result)
+        },
+        update: @escaping Update = { query, attributes in
+            SecItemUpdate(query, attributes)
+        },
+        add: @escaping Add = { query, result in
+            SecItemAdd(query, result)
+        },
+        delete: @escaping Delete = { query in
+            SecItemDelete(query)
         },
         reportReadFailure: @escaping ReadFailureReporter = { failure in
             SystemKeychainService.logReadFailure(failure)
         }
     ) {
+        self.interactionPolicy = interactionPolicy
         self.copyMatching = copyMatching
+        self.update = update
+        self.add = add
+        self.delete = delete
         self.reportReadFailure = reportReadFailure
     }
 
@@ -86,7 +117,7 @@ struct SystemKeychainService: KeychainService {
         if case .success(let data) = legacyResult,
            protectedKeychainWriteStatus(data, service: service, account: account) == errSecSuccess
         {
-            SecItemDelete(keychainQuery(
+            _ = delete(keychainQuery(
                 service: service,
                 account: account,
                 usesDataProtectionKeychain: false
@@ -136,7 +167,7 @@ struct SystemKeychainService: KeychainService {
             try saveToLegacyKeychain(data, service: service, account: account)
             return
         }
-        throw OpenASOError.providerUnavailable("Could not save item to Keychain.")
+        throw KeychainOperationError.status(status)
     }
 
     /// Writes to the Data Protection Keychain only, without any fallback, and returns the
@@ -149,7 +180,7 @@ struct SystemKeychainService: KeychainService {
             usesDataProtectionKeychain: true
         )
         let attributes: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        let status = update(query as CFDictionary, attributes as CFDictionary)
         guard status == errSecItemNotFound else {
             return status
         }
@@ -157,7 +188,7 @@ struct SystemKeychainService: KeychainService {
         var addQuery = query
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        return SecItemAdd(addQuery as CFDictionary, nil)
+        return add(addQuery as CFDictionary, nil)
     }
 
     /// Builds signed without the application identifier entitlement cannot use the Data
@@ -177,30 +208,31 @@ struct SystemKeychainService: KeychainService {
             usesDataProtectionKeychain: false
         )
         let attributes: [String: Any] = [kSecValueData as String: data]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        let updateStatus = update(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess {
             return
         }
 
         guard updateStatus == errSecItemNotFound else {
-            throw OpenASOError.providerUnavailable("Could not save item to Keychain.")
+            throw KeychainOperationError.status(updateStatus)
         }
 
         var addQuery = query
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        guard SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess else {
-            throw OpenASOError.providerUnavailable("Could not save item to Keychain.")
+        let addStatus = add(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw KeychainOperationError.status(addStatus)
         }
     }
 
     func delete(service: String, account: String) {
-        SecItemDelete(keychainQuery(
+        _ = delete(keychainQuery(
             service: service,
             account: account,
             usesDataProtectionKeychain: true
         ) as CFDictionary)
-        SecItemDelete(keychainQuery(
+        _ = delete(keychainQuery(
             service: service,
             account: account,
             usesDataProtectionKeychain: false
@@ -219,6 +251,11 @@ struct SystemKeychainService: KeychainService {
         ]
         if usesDataProtectionKeychain {
             query[kSecUseDataProtectionKeychain as String] = true
+        }
+        if interactionPolicy == .noninteractive {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
         }
         return query
     }

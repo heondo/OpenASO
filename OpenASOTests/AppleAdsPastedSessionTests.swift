@@ -56,6 +56,49 @@ struct AppleAdsPastedSessionTests {
     }
 
     @Test
+    func modernPastedSessionWithoutXSRFTokenIsAccepted() throws {
+        let session = try AppleAdsPastedSession.session(
+            from: "app-ads.sid=authenticated-session; searchads.soid=account",
+            updatedAt: updatedAt
+        )
+
+        #expect(session.xsrfToken.isEmpty)
+        #expect(session.isComplete)
+    }
+
+    @Test
+    func modernCookieSessionIsCompleteWithoutLegacyXSRFToken() {
+        let session = AppleAdsWebSession(
+            cookieHeader: "app-ads.sid=authenticated-session; searchads.soid=account",
+            xsrfToken: "",
+            updatedAt: updatedAt
+        )
+
+        #expect(session.isComplete)
+        #expect(!AppleAdsWebSession(cookieHeader: "searchads.soid=account", xsrfToken: "", updatedAt: updatedAt).isComplete)
+    }
+
+    @Test
+    func webLoginCaptureNeedsSessionPlusTokenOrAuthenticatedCookie() throws {
+        let url = URL(string: "https://app-ads.apple.com/cm/app/report")
+        let sessionCookie = try #require(HTTPCookie(properties: [
+            .domain: ".apple.com", .path: "/", .name: AppleAdsSessionCookies.session, .value: "account", .secure: "TRUE"
+        ]))
+        let authenticatedCookie = try #require(HTTPCookie(properties: [
+            .domain: ".apple.com", .path: "/", .name: AppleAdsSessionCookies.authenticatedSession, .value: "sid", .secure: "TRUE"
+        ]))
+        let xsrfCookie = try #require(HTTPCookie(properties: [
+            .domain: "app-ads.apple.com", .path: "/", .name: AppleAdsSessionCookies.xsrfToken, .value: "token", .secure: "TRUE"
+        ]))
+
+        #expect(AppleAdsWebLoginController.isCaptureReady(url: url, cookies: [sessionCookie, authenticatedCookie]))
+        #expect(AppleAdsWebLoginController.isCaptureReady(url: url, cookies: [sessionCookie, xsrfCookie]))
+        #expect(!AppleAdsWebLoginController.isCaptureReady(url: url, cookies: [authenticatedCookie]))
+        #expect(!AppleAdsWebLoginController.isCaptureReady(url: url, cookies: [sessionCookie]))
+        #expect(!AppleAdsWebLoginController.isCaptureReady(url: nil, cookies: [sessionCookie, authenticatedCookie]))
+    }
+
+    @Test
     func missingSessionCookieIsRejected() {
         #expect(throws: OpenASOError.self) {
             try AppleAdsPastedSession.session(from: "XSRF-TOKEN-CM=token-value", updatedAt: updatedAt)
@@ -165,6 +208,8 @@ struct AppleAdsPastedSessionTests {
         ))
         #expect(script?.contains("host.endsWith(\".apple.com\")") == true)
         #expect(script?.contains("input#password_text_field") == true)
+        #expect(script?.contains("passwordFilled = true") == true)
+        #expect(script?.contains("passwordSubmitted = clickButton") == false)
     }
 
     @Test
@@ -179,5 +224,44 @@ struct AppleAdsPastedSessionTests {
             password: "password"
         ))
         #expect(credentialScript?.contains("__openasoMarkExplicitAccount") == true)
+    }
+
+    @Test
+    func webLoginPolicySuppressesTheSilentAppleAccountHandoff() {
+        let policy = AppleAdsWebLoginAutomation.explicitAccountPolicyScript
+
+        // Patching only the DOM loses a race against Apple's inline reader, so the parse itself is
+        // intercepted too.
+        #expect(policy.contains("JSON.parse = function"))
+        #expect(policy.contains("\"conditional\""))
+        #expect(policy.contains("\"silent\""))
+        // The observer must stay live; disconnecting it was how a re-rendered form escaped the patch.
+        #expect(!policy.contains("bootObserver.disconnect()"))
+    }
+
+    @Test
+    func webLoginPolicyOptsIntoTheLongLivedSession() {
+        let policy = AppleAdsWebLoginAutomation.explicitAccountPolicyScript
+
+        #expect(policy.contains("input#remember-me"))
+        #expect(policy.contains("openasoChecked"))
+    }
+
+    @Test
+    func maskedAccountsAreNotComparable() {
+        // Apple sometimes renders the account already masked. Comparing that against a saved Apple
+        // ID would report a mismatch that is not one.
+        #expect(AppleAdsWebLoginController.comparableAccount("Person@Example.com") == "person@example.com")
+        #expect(AppleAdsWebLoginController.comparableAccount("  person@example.com  ") == "person@example.com")
+        #expect(AppleAdsWebLoginController.comparableAccount("p\u{2022}\u{2022}\u{2022}n@example.com") == nil)
+        #expect(AppleAdsWebLoginController.comparableAccount("p***n@example.com") == nil)
+        #expect(AppleAdsWebLoginController.comparableAccount("   ") == nil)
+    }
+
+    @Test
+    func accountMaskKeepsTheDomainAndHidesTheLocalPart() {
+        #expect(AppleAdsAccountMask.mask("person@example.com") == "p\u{2022}\u{2022}\u{2022}n@example.com")
+        #expect(AppleAdsAccountMask.mask("ab@example.com") == "a\u{2022}\u{2022}\u{2022}@example.com")
+        #expect(AppleAdsAccountMask.mask("") == "an unknown account")
     }
 }

@@ -1,6 +1,9 @@
 import Foundation
+import OSLog
 
 final class AppStoreWebRankingProvider: SearchRankingProvider {
+    private static let logger = Logger(subsystem: OpenASOLog.subsystem, category: "search-ranking")
+
     private let httpClient: any HTTPClient
 
     init(httpClient: any HTTPClient) {
@@ -96,16 +99,24 @@ final class AppStoreWebRankingProvider: SearchRankingProvider {
                 throw SearchRankingProviderError.responseFailure(.malformedSearchResult)
             }
         }
-        guard payloadByID.count == orderedAppStoreIDs.count else {
-            throw SearchRankingProviderError.responseFailure(.lookupHydrationIncomplete)
+        let missingAppStoreIDs = orderedAppStoreIDs.filter { payloadByID[$0] == nil }
+        if !missingAppStoreIDs.isEmpty {
+            let tolerance = SearchRankingCrawl.hydrationMissingIDTolerance(
+                requestedCount: orderedAppStoreIDs.count
+            )
+            guard !payloadByID.isEmpty, missingAppStoreIDs.count <= tolerance else {
+                throw SearchRankingProviderError.responseFailure(.lookupHydrationIncomplete)
+            }
+            Self.logger.warning(
+                "Lookup hydration dropped \(missingAppStoreIDs.count, privacy: .public) of \(orderedAppStoreIDs.count, privacy: .public) ranked apps for \(request.storefrontCode, privacy: .public)/\(request.platform.rawValue, privacy: .public) keyword \(request.keyword, privacy: .private); missing IDs: \(missingAppStoreIDs.map(String.init).joined(separator: ","), privacy: .public)"
+            )
         }
 
         try Task.checkCancellation()
-        return try orderedAppStoreIDs.enumerated().map { index, appStoreID in
-            guard let payload = payloadByID[appStoreID] else {
-                throw SearchRankingProviderError.responseFailure(.lookupHydrationIncomplete)
-            }
-            return payload.searchRankingItem(
+        // Dropped rows keep the survivors at their true search positions;
+        // renumbering would silently corrupt rank history.
+        return orderedAppStoreIDs.enumerated().compactMap { index, appStoreID in
+            payloadByID[appStoreID]?.searchRankingItem(
                 position: index + 1,
                 platform: request.platform
             )

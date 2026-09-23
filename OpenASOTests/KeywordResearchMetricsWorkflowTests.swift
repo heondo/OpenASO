@@ -43,7 +43,15 @@ struct KeywordResearchMetricsWorkflowTests {
         #expect(requests.first?.storefronts == ["GB"])
         #expect(requests.first?.terms == [keyword.term])
         #expect(requests.first?.contextAppStoreID == metricsContextAppStoreID)
-        #expect(requests.first?.cookieHeader == metricsSession.cookieHeader)
+        // The jar builds the header now, so compare against what it produces rather than the order
+        // the fixture happened to write the cookies in.
+        let popularityURL = try #require(
+            URL(string: "https://app-ads.apple.com/cm/api/v2/keywords/popularities")
+        )
+        #expect(
+            requests.first?.cookieHeader
+                == AppleAdsCookieJar(cookies: metricsSession.jarCookies).cookieHeader(for: popularityURL)
+        )
         #expect(requests.first?.xsrfToken == metricsSession.xsrfToken)
     }
 

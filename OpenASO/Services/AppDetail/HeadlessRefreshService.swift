@@ -33,6 +33,134 @@ enum HeadlessRefreshAppDisposition: String, Hashable, Sendable {
     case cancelled
 }
 
+/// A deliberately small, stable diagnostic that is safe to persist and log. It carries no
+/// provider response text, request data, credentials, or other arbitrary error descriptions.
+struct HeadlessRefreshDiagnostic: Codable, Hashable, Sendable {
+    enum Stage: String, Codable, Hashable, Sendable {
+        case planning
+        case metadata
+        case rankings
+        case keywordMetrics
+        case ratings
+        case reviews
+        case setup
+        case timeout
+    }
+
+    enum Provider: String, Codable, Hashable, Sendable {
+        case iTunesLookup
+        case appStoreWeb
+        case appStoreSearch
+        case appleAdsWeb
+        case appStoreConnect
+        case publicAppStore
+        case persistence
+        case internalService
+    }
+
+    enum Severity: String, Codable, Hashable, Sendable {
+        case failure
+        case advisory
+    }
+
+    enum ReasonCode: String, Codable, Hashable, Sendable {
+        case fetchFailed
+        case validationFailed
+        case persistenceFailed
+        case stageFailed
+        case missingOutcome
+        case sessionExpired
+        case popularitySkipped
+        case planUnavailable
+        case timedOut
+    }
+
+    static let maximumPersistedCount = 50
+
+    let appStoreID: Int64
+    let stage: Stage
+    let provider: Provider
+    let storefront: String?
+    let severity: Severity
+    let reasonCode: ReasonCode
+
+    init(
+        appStoreID: Int64,
+        stage: Stage,
+        provider: Provider,
+        storefront: String? = nil,
+        severity: Severity,
+        reasonCode: ReasonCode
+    ) {
+        self.appStoreID = appStoreID
+        self.stage = stage
+        self.provider = provider
+        self.storefront = storefront.map {
+            String($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(16))
+        }.flatMap { $0.isEmpty ? nil : $0 }
+        self.severity = severity
+        self.reasonCode = reasonCode
+    }
+
+    static func bounded(_ diagnostics: [Self]) -> [Self] {
+        Array(diagnostics.prefix(maximumPersistedCount))
+    }
+
+    var safeMessage: String {
+        let location = storefront.map { " for storefront \($0.uppercased())" } ?? ""
+        switch reasonCode {
+        case .fetchFailed:
+            return "\(stage.displayName) from \(provider.displayName) could not be fetched\(location)."
+        case .validationFailed:
+            return "\(stage.displayName) from \(provider.displayName) could not be validated\(location)."
+        case .persistenceFailed:
+            return "\(stage.displayName) from \(provider.displayName) could not be saved\(location)."
+        case .stageFailed:
+            return "\(stage.displayName) from \(provider.displayName) failed\(location)."
+        case .missingOutcome:
+            return "\(stage.displayName) returned no result\(location)."
+        case .sessionExpired:
+            return "Reconnect Apple Ads in Settings. Popularity was not refreshed."
+        case .popularitySkipped:
+            return "Keyword popularity was skipped while Apple Ads needs reconnection."
+        case .planUnavailable:
+            return "The automatic refresh plan could not be prepared."
+        case .timedOut:
+            return "The one-shot automatic refresh exceeded its time limit."
+        }
+    }
+}
+
+private extension HeadlessRefreshDiagnostic.Stage {
+    var displayName: String {
+        switch self {
+        case .planning: "Planning"
+        case .metadata: "Metadata"
+        case .rankings: "Rankings"
+        case .keywordMetrics: "Keyword metrics"
+        case .ratings: "Ratings"
+        case .reviews: "Reviews"
+        case .setup: "Setup"
+        case .timeout: "Refresh"
+        }
+    }
+}
+
+private extension HeadlessRefreshDiagnostic.Provider {
+    var displayName: String {
+        switch self {
+        case .iTunesLookup: "iTunes Lookup"
+        case .appStoreWeb: "App Store web"
+        case .appStoreSearch: "App Store search"
+        case .appleAdsWeb: "Apple Ads"
+        case .appStoreConnect: "App Store Connect"
+        case .publicAppStore: "the public App Store"
+        case .persistence: "local storage"
+        case .internalService: "OpenASO"
+        }
+    }
+}
+
 struct HeadlessRefreshIssue: Hashable, Sendable {
     enum Kind: String, Hashable, Sendable {
         case planUnavailable
@@ -70,18 +198,21 @@ struct HeadlessRefreshAppExecutionResult: Hashable, Sendable {
     let ratingsReviewsAttempted: Bool
     let ratingsReviewsFullySucceeded: Bool
     let issue: HeadlessRefreshIssue?
+    let diagnostics: [HeadlessRefreshDiagnostic]
 
     init(
         disposition: HeadlessRefreshAppDisposition,
         ratingsReviewsAttempted: Bool = false,
         ratingsReviewsFullySucceeded: Bool = false,
-        issue: HeadlessRefreshIssue? = nil
+        issue: HeadlessRefreshIssue? = nil,
+        diagnostics: [HeadlessRefreshDiagnostic] = []
     ) {
         precondition(!ratingsReviewsFullySucceeded || ratingsReviewsAttempted)
         self.disposition = disposition
         self.ratingsReviewsAttempted = ratingsReviewsAttempted
         self.ratingsReviewsFullySucceeded = ratingsReviewsFullySucceeded
         self.issue = issue
+        self.diagnostics = HeadlessRefreshDiagnostic.bounded(diagnostics)
     }
 
     static func succeeded(
@@ -103,9 +234,32 @@ enum HeadlessRefreshAppStageDisposition: Hashable, Sendable {
 
 enum HeadlessRefreshAppResultAdapter {
     static func map(
+        metadataResult: AppMetadataRefreshResult?,
+        metadataStatus: AppMetadataRefreshStatus,
+        metadataDiagnostics: [HeadlessRefreshDiagnostic] = [],
+        detailResult: AppDetailRefreshResult?,
+        detailDiagnostics: [HeadlessRefreshDiagnostic] = [],
+        request: AppDetailRefreshRequest
+    ) -> HeadlessRefreshAppExecutionResult {
+        let diagnostics = HeadlessRefreshDiagnostic.bounded(
+            metadataDiagnostics
+                + (metadataResult.map(Self.metadataDiagnostics) ?? [])
+                + detailDiagnostics
+                + (detailResult.map { Self.detailDiagnostics($0, request: request) } ?? [])
+        )
+        return map(
+            metadataStatus: metadataStatus,
+            detailResult: detailResult,
+            request: request,
+            diagnostics: diagnostics
+        )
+    }
+
+    static func map(
         metadataStatus: AppMetadataRefreshStatus,
         detailResult: AppDetailRefreshResult?,
-        request: AppDetailRefreshRequest
+        request: AppDetailRefreshRequest,
+        diagnostics: [HeadlessRefreshDiagnostic] = []
     ) -> HeadlessRefreshAppExecutionResult {
         let ratingsAttempted = request.refreshRatings
             && !(detailResult?.ratingOutcomes.isEmpty ?? true)
@@ -126,7 +280,8 @@ enum HeadlessRefreshAppResultAdapter {
             return HeadlessRefreshAppExecutionResult(
                 disposition: .cancelled,
                 ratingsReviewsAttempted: ratingsReviewsAttempted,
-                ratingsReviewsFullySucceeded: false
+                ratingsReviewsFullySucceeded: false,
+                diagnostics: diagnostics
             )
         }
 
@@ -155,8 +310,126 @@ enum HeadlessRefreshAppResultAdapter {
             disposition: disposition,
             ratingsReviewsAttempted: ratingsReviewsAttempted,
             ratingsReviewsFullySucceeded: ratingsReviewsFullySucceeded,
-            issue: disposition == .success ? nil : HeadlessRefreshIssue(kind: .appRefreshFailed)
+            issue: disposition == .success ? nil : HeadlessRefreshIssue(kind: .appRefreshFailed),
+            diagnostics: diagnostics
         )
+    }
+
+    private static func metadataDiagnostics(
+        _ result: AppMetadataRefreshResult
+    ) -> [HeadlessRefreshDiagnostic] {
+        result.storefronts.flatMap { outcome in
+            [
+                metadataDiagnostic(
+                    appStoreID: result.appStoreID,
+                    storefront: outcome.storefront,
+                    provider: .iTunesLookup,
+                    outcome: outcome.iTunesLookup
+                ),
+                metadataDiagnostic(
+                    appStoreID: result.appStoreID,
+                    storefront: outcome.storefront,
+                    provider: .appStoreWeb,
+                    outcome: outcome.appStoreWeb
+                ),
+            ].compactMap { $0 }
+        }
+    }
+
+    private static func metadataDiagnostic(
+        appStoreID: Int64,
+        storefront: String,
+        provider: HeadlessRefreshDiagnostic.Provider,
+        outcome: AppMetadataRefreshProviderOutcome
+    ) -> HeadlessRefreshDiagnostic? {
+        guard case .failed(let failure) = outcome else { return nil }
+        let reason: HeadlessRefreshDiagnostic.ReasonCode = switch failure.stage {
+        case .fetch: .fetchFailed
+        case .validation: .validationFailed
+        case .persistence: .persistenceFailed
+        }
+        return HeadlessRefreshDiagnostic(
+            appStoreID: appStoreID,
+            stage: .metadata,
+            provider: provider,
+            storefront: storefront,
+            severity: .failure,
+            reasonCode: reason
+        )
+    }
+
+    private static func detailDiagnostics(
+        _ result: AppDetailRefreshResult,
+        request: AppDetailRefreshRequest
+    ) -> [HeadlessRefreshDiagnostic] {
+        let appStoreID = request.app.appStoreID
+        var diagnostics = result.keywordOutcomes.compactMap { outcome in
+            outcome.error.map { _ in
+                HeadlessRefreshDiagnostic(
+                    appStoreID: appStoreID,
+                    stage: .rankings,
+                    provider: .appStoreSearch,
+                    severity: .failure,
+                    reasonCode: .stageFailed
+                )
+            }
+        }
+        diagnostics += result.metricsDiagnostics.map { diagnostic in
+            HeadlessRefreshDiagnostic(
+                appStoreID: appStoreID,
+                stage: .keywordMetrics,
+                provider: .appleAdsWeb,
+                severity: diagnostic.isAdvisory ? .advisory : .failure,
+                reasonCode: diagnostic.code == .appleAdsSessionExpired
+                    ? .sessionExpired
+                    : .stageFailed
+            )
+        }
+        diagnostics += result.ratingOutcomes.compactMap { outcome in
+            outcome.error.map { _ in
+                HeadlessRefreshDiagnostic(
+                    appStoreID: appStoreID,
+                    stage: .ratings,
+                    provider: .appStoreWeb,
+                    storefront: outcome.storefront,
+                    severity: .failure,
+                    reasonCode: .stageFailed
+                )
+            }
+        }
+        diagnostics += result.reviewOutcomes.compactMap { outcome in
+            outcome.error.map { _ in
+                HeadlessRefreshDiagnostic(
+                    appStoreID: appStoreID,
+                    stage: .reviews,
+                    provider: request.appStoreConnectCredentials.isComplete
+                        ? .appStoreConnect
+                        : .publicAppStore,
+                    storefront: outcome.storefront,
+                    severity: .failure,
+                    reasonCode: .stageFailed
+                )
+            }
+        }
+        if request.refreshRatings && result.ratingOutcomes.isEmpty {
+            diagnostics.append(HeadlessRefreshDiagnostic(
+                appStoreID: appStoreID,
+                stage: .ratings,
+                provider: .appStoreWeb,
+                severity: .failure,
+                reasonCode: .missingOutcome
+            ))
+        }
+        if request.refreshReviews && result.reviewOutcomes.isEmpty {
+            diagnostics.append(HeadlessRefreshDiagnostic(
+                appStoreID: appStoreID,
+                stage: .reviews,
+                provider: .publicAppStore,
+                severity: .failure,
+                reasonCode: .missingOutcome
+            ))
+        }
+        return diagnostics
     }
 
     private static func detailDisposition(
@@ -199,18 +472,31 @@ struct HeadlessRefreshAppAdapter: Sendable {
         _ plan: HeadlessRefreshAppPlan
     ) async throws -> HeadlessRefreshAppExecutionResult {
         try Task.checkCancellation()
+        let metadataResult: AppMetadataRefreshResult?
         let metadataStatus: AppMetadataRefreshStatus
+        var metadataDiagnostics: [HeadlessRefreshDiagnostic] = []
         do {
-            metadataStatus = try await refreshMetadata(plan.metadataRequest).status
+            let result = try await refreshMetadata(plan.metadataRequest)
+            metadataResult = result
+            metadataStatus = result.status
         } catch {
             if error is CancellationError || Task.isCancelled {
                 throw CancellationError()
             }
+            metadataResult = nil
             metadataStatus = .failed
+            metadataDiagnostics = [HeadlessRefreshDiagnostic(
+                appStoreID: plan.appStoreID,
+                stage: .metadata,
+                provider: .internalService,
+                severity: .failure,
+                reasonCode: .stageFailed
+            )]
         }
 
         try Task.checkCancellation()
         let detailResult: AppDetailRefreshResult?
+        var detailDiagnostics: [HeadlessRefreshDiagnostic] = []
         do {
             let result = try await refreshDetail(plan.appDetailRequest)
             if result.wasCancelled {
@@ -222,12 +508,22 @@ struct HeadlessRefreshAppAdapter: Sendable {
                 throw CancellationError()
             }
             detailResult = nil
+            detailDiagnostics = [HeadlessRefreshDiagnostic(
+                appStoreID: plan.appStoreID,
+                stage: .setup,
+                provider: .internalService,
+                severity: .failure,
+                reasonCode: .stageFailed
+            )]
         }
         try Task.checkCancellation()
 
         return HeadlessRefreshAppResultAdapter.map(
+            metadataResult: metadataResult,
             metadataStatus: metadataStatus,
+            metadataDiagnostics: metadataDiagnostics,
             detailResult: detailResult,
+            detailDiagnostics: detailDiagnostics,
             request: plan.appDetailRequest
         )
     }
@@ -248,6 +544,41 @@ struct HeadlessRefreshRunSummary: Hashable, Sendable {
     let ratingsReviewsAttempted: Bool
     let ratingsReviewsFullySucceeded: Bool
     let issue: HeadlessRefreshIssue?
+    let diagnostics: [HeadlessRefreshDiagnostic]
+
+    init(
+        runID: UUID,
+        activeRunID: UUID?,
+        scheduledFor: Date,
+        startedAt: Date,
+        finishedAt: Date,
+        disposition: HeadlessRefreshRunDisposition,
+        plannedAppCount: Int,
+        completedAppCount: Int,
+        successfulAppCount: Int,
+        partialFailureAppCount: Int,
+        failedAppCount: Int,
+        ratingsReviewsAttempted: Bool = false,
+        ratingsReviewsFullySucceeded: Bool = false,
+        issue: HeadlessRefreshIssue?,
+        diagnostics: [HeadlessRefreshDiagnostic] = []
+    ) {
+        self.runID = runID
+        self.activeRunID = activeRunID
+        self.scheduledFor = scheduledFor
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.disposition = disposition
+        self.plannedAppCount = plannedAppCount
+        self.completedAppCount = completedAppCount
+        self.successfulAppCount = successfulAppCount
+        self.partialFailureAppCount = partialFailureAppCount
+        self.failedAppCount = failedAppCount
+        self.ratingsReviewsAttempted = ratingsReviewsAttempted
+        self.ratingsReviewsFullySucceeded = ratingsReviewsFullySucceeded
+        self.issue = issue
+        self.diagnostics = HeadlessRefreshDiagnostic.bounded(diagnostics)
+    }
 
     var redactedLogMessage: String {
         let elapsedSeconds = finishedAt.timeIntervalSince(startedAt)
@@ -317,8 +648,12 @@ enum HeadlessRefreshEvent: Hashable, Sendable {
         switch self {
         case .runStarted(let runID, _, _):
             "Headless refresh started runID=\(runID.uuidString)"
-        case .planLoaded, .appStarted, .appFinished:
-            nil
+        case .planLoaded(let runID, let plannedAppCount):
+            "Headless refresh plan loaded runID=\(runID.uuidString) planned=\(plannedAppCount)"
+        case .appStarted(let runID, let appStoreID, let position, let total):
+            "Headless refresh app started runID=\(runID.uuidString) appStoreID=\(appStoreID) position=\(position) total=\(total)"
+        case .appFinished(let runID, let appStoreID, let position, let total, let disposition):
+            "Headless refresh app finished runID=\(runID.uuidString) appStoreID=\(appStoreID) position=\(position) total=\(total) disposition=\(disposition.rawValue)"
         case .runFinished(let summary):
             summary.redactedLogMessage
         case .runSkipped(let requestRunID, let activeRunID, _):
@@ -536,7 +871,13 @@ actor HeadlessRefreshService {
 
                 let result: HeadlessRefreshAppExecutionResult
                 do {
-                    result = try await dependencies.refreshApp(appPlan)
+                    result = try await RefreshObservationScope.$parentHeadlessRunID
+                        .withValue(request.id) {
+                            try await RefreshObservationScope.$appStoreID
+                                .withValue(appPlan.appStoreID) {
+                                    try await dependencies.refreshApp(appPlan)
+                                }
+                        }
                 } catch {
                     if Self.isCancellation(error) {
                         await publish(.appFinished(
@@ -550,7 +891,14 @@ actor HeadlessRefreshService {
                     }
                     result = HeadlessRefreshAppExecutionResult(
                         disposition: .failure,
-                        issue: HeadlessRefreshIssue(kind: .appRefreshFailed)
+                        issue: HeadlessRefreshIssue(kind: .appRefreshFailed),
+                        diagnostics: [HeadlessRefreshDiagnostic(
+                            appStoreID: appPlan.appStoreID,
+                            stage: .setup,
+                            provider: .internalService,
+                            severity: .failure,
+                            reasonCode: .stageFailed
+                        )]
                     )
                 }
 
@@ -653,7 +1001,8 @@ actor HeadlessRefreshService {
             ratingsReviewsFullySucceeded: !ratingsReviewsResults.isEmpty
                 && ratingsReviewsResults.count == plannedAppCount
                 && ratingsReviewsResults.allSatisfy(\.ratingsReviewsFullySucceeded),
-            issue: issue
+            issue: issue,
+            diagnostics: results.flatMap(\.diagnostics)
         )
         recentRuns.insert(summary, at: 0)
         completedRunsByID[request.id] = CompletedRun(

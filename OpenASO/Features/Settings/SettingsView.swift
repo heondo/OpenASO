@@ -58,6 +58,7 @@ struct SettingsView: View {
                         .disabled(!services.settingsStore.isAutomaticRefreshEnabled)
                         .onChange(of: dailyRefreshTime) { _, newValue in
                             services.settingsStore.saveRefreshTime(from: newValue)
+                            services.restartInAppDailyRefreshScheduler()
                         }
 
                     BackgroundRefreshAgentStatusView(
@@ -93,6 +94,8 @@ struct SettingsView: View {
 
                 appStoreConnectSection
                     .id(AppleAdsSettingsFocusSection.appStoreConnect)
+
+                menuBarSection
 
                 analyticsSection
                     .id(AppleAdsSettingsFocusSection.analytics)
@@ -145,6 +148,16 @@ struct SettingsView: View {
                 guard !connectionState.isBusy else { return }
                 connectionState = inferredConnectionState()
             }
+        }
+    }
+
+    private var menuBarSection: some View {
+        Section {
+            Toggle("Show Menu Bar Icon", isOn: menuBarIconVisible)
+        } header: {
+            Text("Menu Bar")
+        } footer: {
+            Text("Shows OpenASO in the menu bar with the latest automatic refresh result and Apple Ads connection status. Turning this off does not change refreshing or any other behavior.")
         }
     }
 
@@ -622,6 +635,7 @@ struct SettingsView: View {
             get: { services.settingsStore.isAutomaticRefreshEnabled },
             set: { isEnabled in
                 services.settingsStore.setAutomaticRefreshEnabled(isEnabled)
+                services.restartInAppDailyRefreshScheduler()
                 Task { @MainActor in
                     await services.backgroundRefreshAgentController.reconcile(
                         isEnabled: isEnabled
@@ -638,11 +652,19 @@ struct SettingsView: View {
         )
     }
 
+    private var menuBarIconVisible: Binding<Bool> {
+        Binding(
+            get: { services.settingsStore.showsMenuBarIcon },
+            set: { services.settingsStore.setShowsMenuBarIcon($0) }
+        )
+    }
+
     private var showsManualAppleAdsAppIDFallback: Bool {
         switch connectionState {
         case .expiredSession, .noLinkedApps, .apiIssue:
             return true
-        case .notConnected, .accountSelectionRequired, .openingBrowser, .detectingLinkedApp, .validatingSession, .connected:
+        case .notConnected, .accountSelectionRequired, .wrongAccount, .openingBrowser,
+             .detectingLinkedApp, .validatingSession, .connected:
             return false
         }
     }
@@ -851,6 +873,9 @@ struct SettingsView: View {
 
     private func clearWebSession() {
         services.appleAdsWebSessionStore.clear()
+        // Disconnecting means the next sign-in starts from nothing, so the trusted-browser cookie
+        // this Mac earned goes too. Reconnecting will ask for 2FA again, which is the point.
+        Task { await AppleAdsWebLoginController.clearPersistedLoginData() }
         services.settingsStore.clearPopularityContextAppStoreID()
         manualAppleAdsAppID = ""
         manualAppleAdsStatus = nil

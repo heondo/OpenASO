@@ -158,4 +158,20 @@ struct AppleAdsConnectionStateTests {
         #expect(state == .accountSelectionRequired)
         #expect(state.primaryActionTitle == "Choose Account")
     }
+
+    @Test
+    func signingInAsAnotherAppleIDNamesBothAccounts() {
+        let state = AppleAdsConnectionState.classified(
+            error: AppleAdsWebLoginError.wrongAccount(
+                signedIn: "p\u{2022}\u{2022}\u{2022}n@icloud.com",
+                expected: "a\u{2022}\u{2022}\u{2022}s@example.com"
+            ),
+            hasSession: false
+        )
+
+        #expect(state.primaryActionTitle == "Choose Account")
+        #expect(state.message.contains("p\u{2022}\u{2022}\u{2022}n@icloud.com"))
+        #expect(state.message.contains("a\u{2022}\u{2022}\u{2022}s@example.com"))
+        #expect(!state.isBusy)
+    }
 }

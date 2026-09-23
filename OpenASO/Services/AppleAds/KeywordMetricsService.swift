@@ -8,6 +8,9 @@ final class KeywordMetricsService: Sendable {
     @MainActor private let popularityClient: AppleAdsPopularityClient
     @MainActor private let settingsStore: AppSettingsStore
     @MainActor private let webSessionStore: AppleAdsWebSessionStore
+    /// The store's jar, held directly so the nonisolated fetch paths can build requests without
+    /// hopping to the main actor for every call.
+    private let cookieJar: AppleAdsCookieJar
     private let freshnessFetchObserver: @Sendable (_ queryKeyCount: Int) -> Void
     private let bulkFreshnessFetchHook: @Sendable () throws -> Void
     private let metricsTTL: TimeInterval = 60 * 60 * 24 * 7
@@ -25,6 +28,7 @@ final class KeywordMetricsService: Sendable {
         self.apiClient = AppleAdsAPIClient(httpClient: httpClient)
         self.settingsStore = settingsStore
         self.webSessionStore = webSessionStore
+        self.cookieJar = webSessionStore.cookieJar
         self.freshnessFetchObserver = freshnessFetchObserver
         self.bulkFreshnessFetchHook = bulkFreshnessFetchHook
         self.popularityClient = AppleAdsPopularityClient(
@@ -71,6 +75,27 @@ final class KeywordMetricsService: Sendable {
         webSession: AppleAdsWebSession,
         now: @Sendable () -> Date = { Date() }
     ) async throws -> [KeywordPopularityMetricEvidence] {
+        do {
+            let evidence = try await fetchPopularityMetricsWithoutCleanup(
+                for: targets,
+                contextAppStoreID: contextAppStoreID,
+                webSession: webSession,
+                now: now
+            )
+            await webSessionStore.persistRotatedCookies()
+            return evidence
+        } catch {
+            await webSessionStore.persistRotatedCookies()
+            throw error
+        }
+    }
+
+    private func fetchPopularityMetricsWithoutCleanup(
+        for targets: [KeywordResearchTarget],
+        contextAppStoreID: Int64,
+        webSession: AppleAdsWebSession,
+        now: @Sendable () -> Date
+    ) async throws -> [KeywordPopularityMetricEvidence] {
         try Task.checkCancellation()
         guard contextAppStoreID > 0 else {
             throw OpenASOError.invalidAppStoreID
@@ -82,7 +107,7 @@ final class KeywordMetricsService: Sendable {
         let orderedTargets = Self.orderedUniquePopularityTargets(targets)
         guard !orderedTargets.isEmpty else { return [] }
 
-        let popularityClient = AppleAdsCMPopularityClient(httpClient: httpClient)
+        let popularityClient = AppleAdsCMPopularityClient(httpClient: httpClient, cookieJar: cookieJar)
         var popularityByQueryKey: [String: Int] = [:]
         let targetsByStorefront = Dictionary(grouping: orderedTargets, by: \.storefront)
 
@@ -360,6 +385,31 @@ final class KeywordMetricsService: Sendable {
         progress: (@Sendable (_ completed: Int, _ total: Int, _ failureCount: Int) async -> Void)? = nil,
         didPersist: (@Sendable (KeywordMetricsPersistenceUpdate) async -> Void)? = nil
     ) async throws -> KeywordMetricsRefreshBatchResult {
+        do {
+            let result = try await refreshMetricsBatchWithoutCleanup(
+                for: trackIdentityKeys,
+                popularityContextAppStoreID: popularityContextAppStoreID,
+                webSession: webSession,
+                using: modelStore,
+                progress: progress,
+                didPersist: didPersist
+            )
+            await webSessionStore.persistRotatedCookies()
+            return result
+        } catch {
+            await webSessionStore.persistRotatedCookies()
+            throw error
+        }
+    }
+
+    private func refreshMetricsBatchWithoutCleanup(
+        for trackIdentityKeys: [String],
+        popularityContextAppStoreID: Int64?,
+        webSession: AppleAdsWebSession?,
+        using modelStore: BackgroundModelStore,
+        progress: (@Sendable (_ completed: Int, _ total: Int, _ failureCount: Int) async -> Void)?,
+        didPersist: (@Sendable (KeywordMetricsPersistenceUpdate) async -> Void)?
+    ) async throws -> KeywordMetricsRefreshBatchResult {
         try Task.checkCancellation()
         guard !trackIdentityKeys.isEmpty else { return .empty }
 
@@ -476,7 +526,7 @@ final class KeywordMetricsService: Sendable {
             return KeywordMetricsRefreshBatchResult(outcomes: outcomes, batchErrors: batchErrors)
         }
 
-        let cmPopularityClient = AppleAdsCMPopularityClient(httpClient: httpClient)
+        let cmPopularityClient = AppleAdsCMPopularityClient(httpClient: httpClient, cookieJar: cookieJar)
         let storefrontGroups = Self.orderedCandidateGroups(tracksNeedingPopularity)
         try Task.checkCancellation()
         if await webSessionStore.requiresReconnect(for: webSession) {
@@ -1146,6 +1196,19 @@ struct KeywordMetricsRefreshBatchResult: Sendable {
     var firstErrorMessage: String? {
         batchErrors.first?.message ?? outcomes.lazy.compactMap(\.errorMessage).first
     }
+
+    /// Session expiry is actionable through the persistent Settings/cell state,
+    /// but it is not an operational failure of ranking refresh. Interactive app
+    /// refreshes use these projections; MCP keeps the structured batch error.
+    var operationalFailureCount: Int {
+        outcomes.lazy.filter { $0.errorMessage != nil }.count
+            + batchErrors.lazy.filter { $0.code != .appleAdsSessionExpired }.count
+    }
+
+    var firstOperationalErrorMessage: String? {
+        batchErrors.lazy.first { $0.code != .appleAdsSessionExpired }?.message
+            ?? outcomes.lazy.compactMap(\.errorMessage).first
+    }
 }
 
 struct StalePopularityRefreshPreparation: Sendable {
@@ -1342,7 +1405,10 @@ private final class AppleAdsPopularityClient {
         webSessionStore: AppleAdsWebSessionStore
     ) {
         self.webSessionStore = webSessionStore
-        self.cmPopularityClient = AppleAdsCMPopularityClient(httpClient: httpClient)
+        self.cmPopularityClient = AppleAdsCMPopularityClient(
+            httpClient: httpClient,
+            cookieJar: webSessionStore.cookieJar
+        )
     }
 
     func recoverSessionIfNeeded() -> AppleAdsWebSession? {
@@ -1353,6 +1419,8 @@ private final class AppleAdsPopularityClient {
         guard let session = webSessionStore.recoverSessionIfNeeded(), session.isComplete else {
             return .missingCredentials
         }
+
+        defer { webSessionStore.persistRotatedCookies() }
 
         do {
             if let popularity = try await cmPopularityClient.keywordPopularity(
@@ -1379,6 +1447,8 @@ private final class AppleAdsPopularityClient {
         guard let session, session.isComplete else {
             return .missingCredentials
         }
+
+        defer { webSessionStore.persistRotatedCookies() }
 
         do {
             try Task.checkCancellation()

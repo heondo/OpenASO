@@ -6,8 +6,17 @@ struct BackgroundRefreshAgentStatusView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(title, systemImage: systemImage)
-                .font(.callout)
+            Label {
+                Text(title)
+            } icon: {
+                if isStale {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(.orange)
+                } else {
+                    Image(systemName: systemImage)
+                }
+            }
+            .font(.callout)
 
             Text(detail)
                 .font(.callout)
@@ -26,11 +35,11 @@ struct BackgroundRefreshAgentStatusView: View {
                     controller.openSystemSettings()
                 }
             } else if automaticRefreshEnabled,
-                      controller.status != .enabled
+                      controller.status != .enabled || isStale
             {
                 Button("Retry Background Setup") {
                     Task { @MainActor in
-                        await controller.reconcile(isEnabled: true)
+                        await controller.reconcile(isEnabled: true, force: true)
                     }
                 }
                 .disabled(controller.isReconciling)
@@ -38,9 +47,17 @@ struct BackgroundRefreshAgentStatusView: View {
         }
     }
 
+    /// `.enabled` only means the registration exists; launchd can still refuse to spawn it.
+    private var isStale: Bool {
+        automaticRefreshEnabled && controller.isAgentStale()
+    }
+
     private var title: String {
         guard automaticRefreshEnabled else {
             return "Background refresh is off"
+        }
+        if isStale {
+            return "Background refresh isn't starting"
         }
         switch controller.status {
         case .enabled:
@@ -60,6 +77,9 @@ struct BackgroundRefreshAgentStatusView: View {
         guard automaticRefreshEnabled else {
             return "OpenASO will not run scheduled refreshes."
         }
+        if isStale {
+            return "macOS is not launching the background service. Scheduled refreshes still run while OpenASO is open."
+        }
         switch controller.status {
         case .enabled:
             return "It can run while OpenASO is closed or the screen is locked, as long as this user is logged in and the Mac is awake."
@@ -74,6 +94,9 @@ struct BackgroundRefreshAgentStatusView: View {
 
     private var systemImage: String {
         guard automaticRefreshEnabled else { return "pause.circle" }
+        if isStale {
+            return "exclamationmark.triangle.fill"
+        }
         switch controller.status {
         case .enabled:
             return "checkmark.circle.fill"

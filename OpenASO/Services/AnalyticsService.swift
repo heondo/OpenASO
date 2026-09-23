@@ -12,6 +12,28 @@ enum MCPServerPort {
 }
 
 struct BackgroundRefreshRunRecord: Codable, Equatable, Sendable {
+  enum ExecutionOrigin: String, Codable, Hashable, Sendable {
+    case gui
+    case oneShot
+  }
+
+  struct BuildIdentity: Codable, Hashable, Sendable {
+    let shortVersion: String
+    let buildVersion: String
+
+    static func current(bundle: Bundle = .main) -> Self {
+      Self(
+        shortVersion: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+          as? String ?? "0",
+        buildVersion: bundle.object(forInfoDictionaryKey: "CFBundleVersion")
+          as? String ?? "0"
+      )
+    }
+  }
+
+  let runID: UUID?
+  let executionOrigin: ExecutionOrigin?
+  let buildIdentity: BuildIdentity?
   let scheduledFor: Date
   let finishedAt: Date
   let disposition: String
@@ -21,8 +43,17 @@ struct BackgroundRefreshRunRecord: Codable, Equatable, Sendable {
   let partialFailureAppCount: Int
   let failedAppCount: Int
   let issueMessage: String?
+  let diagnostics: [HeadlessRefreshDiagnostic]
 
-  init(summary: HeadlessRefreshRunSummary) {
+  init(
+    summary: HeadlessRefreshRunSummary,
+    executionOrigin: ExecutionOrigin = .gui,
+    buildIdentity: BuildIdentity = .current(),
+    additionalDiagnostics: [HeadlessRefreshDiagnostic] = []
+  ) {
+    runID = summary.runID
+    self.executionOrigin = executionOrigin
+    self.buildIdentity = buildIdentity
     scheduledFor = summary.scheduledFor
     finishedAt = summary.finishedAt
     disposition = summary.disposition.rawValue
@@ -32,14 +63,24 @@ struct BackgroundRefreshRunRecord: Codable, Equatable, Sendable {
     partialFailureAppCount = summary.partialFailureAppCount
     failedAppCount = summary.failedAppCount
     issueMessage = summary.issue?.message
+    diagnostics = HeadlessRefreshDiagnostic.bounded(
+      summary.diagnostics + additionalDiagnostics
+    )
   }
 
   init(
     scheduledFor: Date,
     finishedAt: Date,
     disposition: HeadlessRefreshRunDisposition,
-    issueMessage: String
+    issueMessage: String,
+    runID: UUID? = nil,
+    executionOrigin: ExecutionOrigin? = nil,
+    buildIdentity: BuildIdentity? = nil,
+    diagnostics: [HeadlessRefreshDiagnostic] = []
   ) {
+    self.runID = runID
+    self.executionOrigin = executionOrigin
+    self.buildIdentity = buildIdentity
     self.scheduledFor = scheduledFor
     self.finishedAt = finishedAt
     self.disposition = disposition.rawValue
@@ -49,7 +90,42 @@ struct BackgroundRefreshRunRecord: Codable, Equatable, Sendable {
     partialFailureAppCount = 0
     failedAppCount = 0
     self.issueMessage = issueMessage
+    self.diagnostics = HeadlessRefreshDiagnostic.bounded(diagnostics)
   }
+
+  private enum CodingKeys: String, CodingKey {
+    case runID, executionOrigin, buildIdentity, scheduledFor, finishedAt, disposition
+    case plannedAppCount, completedAppCount, successfulAppCount
+    case partialFailureAppCount, failedAppCount, issueMessage, diagnostics
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    runID = try container.decodeIfPresent(UUID.self, forKey: .runID)
+    executionOrigin = try container.decodeIfPresent(ExecutionOrigin.self, forKey: .executionOrigin)
+    buildIdentity = try container.decodeIfPresent(BuildIdentity.self, forKey: .buildIdentity)
+    scheduledFor = try container.decode(Date.self, forKey: .scheduledFor)
+    finishedAt = try container.decode(Date.self, forKey: .finishedAt)
+    disposition = try container.decode(String.self, forKey: .disposition)
+    plannedAppCount = try container.decode(Int.self, forKey: .plannedAppCount)
+    completedAppCount = try container.decode(Int.self, forKey: .completedAppCount)
+    successfulAppCount = try container.decode(Int.self, forKey: .successfulAppCount)
+    partialFailureAppCount = try container.decode(Int.self, forKey: .partialFailureAppCount)
+    failedAppCount = try container.decode(Int.self, forKey: .failedAppCount)
+    issueMessage = try container.decodeIfPresent(String.self, forKey: .issueMessage)
+    diagnostics = HeadlessRefreshDiagnostic.bounded(
+      try container.decodeIfPresent([HeadlessRefreshDiagnostic].self, forKey: .diagnostics) ?? []
+    )
+  }
+}
+
+struct BackgroundRefreshActiveAttemptRecord: Codable, Equatable, Sendable {
+  let runID: UUID
+  let claimedAt: Date
+  let scheduledFor: Date
+  let lastPhase: String
+  let executionOrigin: BackgroundRefreshRunRecord.ExecutionOrigin
+  let buildIdentity: BackgroundRefreshRunRecord.BuildIdentity
 }
 
 @MainActor
@@ -67,13 +143,16 @@ final class AppSettingsStore {
       "dailyRefresh.automaticClaimMigrationCompleted"
     static let lastRatingsReviewsRefreshAt = "dailyRefresh.lastRatingsReviewsRefreshAt"
     static let lastBackgroundRefreshRun = "dailyRefresh.lastBackgroundRefreshRun"
+    static let activeBackgroundRefreshAttempt = "dailyRefresh.activeBackgroundRefreshAttempt"
     static let mcpServerPort = "mcp.serverPort"
     static let mcpServerAutostart = "mcp.serverAutostart"
+    static let showsMenuBarIcon = "menuBar.showsIcon"
   }
 
   static let defaultIsAnalyticsEnabled = true
   static let defaultIsAutomaticRefreshEnabled = true
   static let defaultRefreshTimeMinutes = 5 * 60
+  static let defaultShowsMenuBarIcon = true
 
   private let defaults: UserDefaults
 
@@ -86,8 +165,10 @@ final class AppSettingsStore {
   private(set) var lastAutomaticRefreshClaimedAt: Date?
   private(set) var lastRatingsReviewsRefreshAt: Date?
   private(set) var lastBackgroundRefreshRun: BackgroundRefreshRunRecord?
+  private(set) var activeBackgroundRefreshAttempt: BackgroundRefreshActiveAttemptRecord?
   private(set) var mcpServerPort: Int
   private(set) var mcpServerAutostart: Bool
+  private(set) var showsMenuBarIcon: Bool
   var requestedSettingsFocusSection: AppleAdsSettingsFocusSection?
 
   init(defaults: UserDefaults = .openASOShared) {
@@ -134,9 +215,18 @@ final class AppSettingsStore {
     self.lastRatingsReviewsRefreshAt =
       defaults.object(forKey: DefaultsKey.lastRatingsReviewsRefreshAt) as? Date
     self.lastBackgroundRefreshRun = Self.loadBackgroundRefreshRun(from: defaults)
+    self.activeBackgroundRefreshAttempt = Self.loadActiveBackgroundRefreshAttempt(from: defaults)
     self.mcpServerPort = Self.normalizedMCPServerPort(storedMCPServerPort)
     self.mcpServerAutostart = defaults.bool(forKey: DefaultsKey.mcpServerAutostart)
+    self.showsMenuBarIcon =
+      (defaults.object(forKey: DefaultsKey.showsMenuBarIcon) as? Bool)
+      ?? Self.defaultShowsMenuBarIcon
     self.requestedSettingsFocusSection = nil
+  }
+
+  func setShowsMenuBarIcon(_ showsIcon: Bool) {
+    defaults.set(showsIcon, forKey: DefaultsKey.showsMenuBarIcon)
+    showsMenuBarIcon = showsIcon
   }
 
   func requestSettingsFocus(_ section: AppleAdsSettingsFocusSection) {
@@ -316,8 +406,21 @@ final class AppSettingsStore {
     lastBackgroundRefreshRun = record
   }
 
+  func recordActiveBackgroundRefreshAttempt(_ record: BackgroundRefreshActiveAttemptRecord) {
+    guard let data = try? JSONEncoder().encode(record) else { return }
+    defaults.set(data, forKey: DefaultsKey.activeBackgroundRefreshAttempt)
+    activeBackgroundRefreshAttempt = record
+  }
+
+  func clearActiveBackgroundRefreshAttempt(runID: UUID) {
+    guard activeBackgroundRefreshAttempt?.runID == runID else { return }
+    defaults.removeObject(forKey: DefaultsKey.activeBackgroundRefreshAttempt)
+    activeBackgroundRefreshAttempt = nil
+  }
+
   func reloadBackgroundRefreshState() {
     lastBackgroundRefreshRun = Self.loadBackgroundRefreshRun(from: defaults)
+    activeBackgroundRefreshAttempt = Self.loadActiveBackgroundRefreshAttempt(from: defaults)
     lastRefreshTriggeredAt = defaults.object(forKey: DefaultsKey.lastRefreshTriggeredAt) as? Date
     lastAutomaticRefreshClaimedAt =
       defaults.object(forKey: DefaultsKey.lastAutomaticRefreshClaimedAt) as? Date
@@ -349,6 +452,15 @@ final class AppSettingsStore {
       return nil
     }
     return try? JSONDecoder().decode(BackgroundRefreshRunRecord.self, from: data)
+  }
+
+  private static func loadActiveBackgroundRefreshAttempt(
+    from defaults: UserDefaults
+  ) -> BackgroundRefreshActiveAttemptRecord? {
+    guard let data = defaults.data(forKey: DefaultsKey.activeBackgroundRefreshAttempt) else {
+      return nil
+    }
+    return try? JSONDecoder().decode(BackgroundRefreshActiveAttemptRecord.self, from: data)
   }
 
   private static func normalizedMCPServerPort(_ port: Int?) -> Int {

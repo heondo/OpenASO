@@ -138,6 +138,8 @@ struct RefreshRunSummary: Equatable, Sendable {
     let durationNanoseconds: UInt64
     let observedCancellation: Bool
     let result: RefreshRunResult
+    let parentHeadlessRunID: UUID?
+    let appStoreID: Int64?
 
     var redactedLogMessage: String {
         let providerText = providers
@@ -160,7 +162,9 @@ struct RefreshRunSummary: Equatable, Sendable {
                 "\(stage.rawValue){attempted=\(summary.attemptedCount),failures=\(summary.failureCount),skipped=\(summary.isSkipped)}"
             }
             .joined(separator: ";")
-        return "Refresh completed id=\(id.uuidString) trigger=\(trigger.rawValue) workspace=\(workspace.rawValue) result=\(result.rawValue) observedCancellation=\(observedCancellation) durationMs=\(durationNanoseconds / 1_000_000) requestedTracks=\(requestedTrackCount) requestedStorefronts=\(requestedStorefrontCount) resolvedRankings=\(resolvedRankingCount) uniqueRankingQueries=\(uniqueRankingQueryCount) missingRankings=\(missingRankingCount) stages=[\(stageText)] providers=[\(providerText)]"
+        let parent = parentHeadlessRunID?.uuidString ?? "none"
+        let app = appStoreID.map(String.init) ?? "none"
+        return "Refresh completed id=\(id.uuidString) parentRunID=\(parent) appStoreID=\(app) trigger=\(trigger.rawValue) workspace=\(workspace.rawValue) result=\(result.rawValue) observedCancellation=\(observedCancellation) durationMs=\(durationNanoseconds / 1_000_000) requestedTracks=\(requestedTrackCount) requestedStorefronts=\(requestedStorefrontCount) resolvedRankings=\(resolvedRankingCount) uniqueRankingQueries=\(uniqueRankingQueryCount) missingRankings=\(missingRankingCount) stages=[\(stageText)] providers=[\(providerText)]"
     }
 }
 
@@ -182,6 +186,8 @@ struct RefreshObservationClock: Sendable {
 
 enum RefreshObservationScope {
     @TaskLocal static var runID: UUID?
+    @TaskLocal static var parentHeadlessRunID: UUID?
+    @TaskLocal static var appStoreID: Int64?
 }
 
 actor RefreshMetricsRecorder {
@@ -192,6 +198,8 @@ actor RefreshMetricsRecorder {
         let requestedTrackCount: Int
         let requestedStorefrontCount: Int
         let startedAtNanoseconds: UInt64
+        let parentHeadlessRunID: UUID?
+        let appStoreID: Int64?
         var resolvedRankingCount = 0
         var uniqueRankingQueryCount = 0
         var missingRankingCount = 0
@@ -226,7 +234,9 @@ actor RefreshMetricsRecorder {
             workspace: workspace,
             requestedTrackCount: max(0, requestedTrackCount),
             requestedStorefrontCount: max(0, requestedStorefrontCount),
-            startedAtNanoseconds: clock.nowNanoseconds()
+            startedAtNanoseconds: clock.nowNanoseconds(),
+            parentHeadlessRunID: RefreshObservationScope.parentHeadlessRunID,
+            appStoreID: RefreshObservationScope.appStoreID
         )
         return id
     }
@@ -327,7 +337,9 @@ actor RefreshMetricsRecorder {
                 endingAt: clock.nowNanoseconds()
             ),
             observedCancellation: observedCancellation,
-            result: result
+            result: result,
+            parentHeadlessRunID: run.parentHeadlessRunID,
+            appStoreID: run.appStoreID
         )
         completed.append(summary)
         if completed.count > maximumCompletedSummaryCount {

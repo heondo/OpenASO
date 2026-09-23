@@ -8,12 +8,19 @@ enum AppleAdsSessionCookies {
     static let host = "app-ads.apple.com"
     static let xsrfToken = "XSRF-TOKEN-CM"
     static let session = "searchads.soid"
+    /// Apple's newer authenticated-session cookie. Recent sign-ins issue this alongside
+    /// `searchads.soid` and no longer hand out `XSRF-TOKEN-CM` up front, so a session is usable
+    /// with either the legacy token or this cookie.
+    static let authenticatedSession = "app-ads.sid"
 }
 
 struct AppleAdsWebLoginCapture: Equatable, Sendable {
     var cookieHeader: String
     var xsrfToken: String
     var accountName: String?
+    /// The cookies behind `cookieHeader`, attributes intact, so the jar starts out knowing each
+    /// cookie's domain, path, and expiry rather than inferring them.
+    var cookies: [AppleAdsCookie] = []
 }
 
 @MainActor
@@ -27,6 +34,7 @@ protocol AppleAdsWebLoginCapturing: AnyObject {
 enum AppleAdsWebLoginError: LocalizedError, Equatable {
     case closedBeforeCapture
     case explicitAccountRequired
+    case wrongAccount(signedIn: String, expected: String)
     case timedOut
 
     var errorDescription: String? {
@@ -35,9 +43,30 @@ enum AppleAdsWebLoginError: LocalizedError, Equatable {
             return "The Apple Ads sign-in window closed before OpenASO captured the session."
         case .explicitAccountRequired:
             return "OpenASO will not use the Mac's default Apple Account. Try again, choose Use a Different Apple Account if Apple asks, then enter the Apple ID you want OpenASO to use."
+        case let .wrongAccount(signedIn, expected):
+            return "Apple signed in as \(signedIn), but OpenASO's saved Apple ID is \(expected). Sign out of \(signedIn) in the window, or update the saved Apple ID in Settings."
         case .timedOut:
             return "Timed out waiting for Apple Ads sign-in. Sign in and finish 2FA in the window, then try again."
         }
+    }
+}
+
+/// Masks an Apple ID for display in errors and logs: enough to recognise the account, not enough to
+/// leak it wholesale into a log file the user may share.
+enum AppleAdsAccountMask {
+    static func mask(_ account: String) -> String {
+        let trimmed = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let atIndex = trimmed.firstIndex(of: "@") else {
+            return redactLocalPart(String(trimmed))
+        }
+        let local = String(trimmed[trimmed.startIndex ..< atIndex])
+        let domain = String(trimmed[atIndex...])
+        return redactLocalPart(local) + domain
+    }
+
+    private static func redactLocalPart(_ local: String) -> String {
+        guard local.count > 2 else { return local.isEmpty ? "an unknown account" : "\(local.prefix(1))\u{2022}\u{2022}\u{2022}" }
+        return "\(local.prefix(1))\u{2022}\u{2022}\u{2022}\(local.suffix(1))"
     }
 }
 
@@ -58,7 +87,12 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
     private var window: NSWindow?
     private var webView: WKWebView?
     private var didCloseWindow = false
+    /// Whether an account was picked deliberately — typed, autofilled into the field, or filled from
+    /// the saved credentials — as opposed to Apple silently reusing the Mac's Apple Account.
     private var didUseExplicitAccount = false
+    /// The Apple ID Apple actually signed in, when the page revealed it. Held in memory for the
+    /// duration of one capture and never persisted.
+    private var observedAccount: String?
 
     /// Presents the sign-in window and resolves once Apple Ads has handed out a usable session.
     ///
@@ -72,6 +106,11 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
         let webView = presentWindow(credentials: credentials)
         defer { dismissWindow() }
 
+        // Drop the previous Apple Ads session before loading, so a stale `searchads.soid` cannot
+        // satisfy capture the instant the window opens. Apple's own sign-in cookies stay put — they
+        // are what keeps this Mac a trusted browser and this session long-lived.
+        await Self.clearAppleAdsSessionCookies(in: webView.configuration.websiteDataStore)
+
         webView.load(URLRequest(url: Self.signInURL))
 
         let clock = ContinuousClock()
@@ -84,11 +123,8 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
                 throw AppleAdsWebLoginError.closedBeforeCapture
             }
 
-            if Self.isAuthenticatedAppleAdsPage(webView.url),
-               let capture = await capturedSession(from: webView) {
-                guard didUseExplicitAccount else {
-                    throw AppleAdsWebLoginError.explicitAccountRequired
-                }
+            if let capture = await capturedSession(from: webView) {
+                try verifyCapturedAccount(expecting: credentials?.trimmed)
                 Self.logger.info("Captured Apple Ads web session from the in-app sign-in window.")
                 return capture
             }
@@ -103,16 +139,118 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
         let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
         let appleAdsCookies = cookies.filter(Self.appliesToAppleAds)
 
-        guard let xsrfCookie = appleAdsCookies.first(where: { $0.name == AppleAdsSessionCookies.xsrfToken }),
-              appleAdsCookies.contains(where: { $0.name == AppleAdsSessionCookies.session })
-        else {
+        guard Self.isCaptureReady(url: webView.url, cookies: appleAdsCookies) else {
+            logCookiesIfChanged(appleAdsCookies, url: webView.url)
             return nil
         }
 
         return AppleAdsWebLoginCapture(
             cookieHeader: Self.cookieHeader(from: appleAdsCookies),
-            xsrfToken: xsrfCookie.value,
-            accountName: await accountName(from: webView)
+            xsrfToken: appleAdsCookies.first { $0.name == AppleAdsSessionCookies.xsrfToken }?.value ?? "",
+            accountName: await accountName(from: webView),
+            cookies: appleAdsCookies
+                .map(AppleAdsCookie.init)
+                .sorted { $0.name == $1.name ? $0.path < $1.path : $0.name < $1.name }
+        )
+    }
+
+    /// A session is usable once Apple has issued `searchads.soid` together with either the legacy
+    /// `XSRF-TOKEN-CM` or the newer `app-ads.sid`. The page URL is not part of the decision: those
+    /// cookies only exist after a completed sign-in, whatever path Apple happens to land on.
+    nonisolated static func isCaptureReady(url: URL?, cookies: [HTTPCookie]) -> Bool {
+        guard url != nil,
+              cookies.contains(where: { $0.name == AppleAdsSessionCookies.session })
+        else {
+            return false
+        }
+
+        return cookies.contains { cookie in
+            [AppleAdsSessionCookies.xsrfToken, AppleAdsSessionCookies.authenticatedSession]
+                .contains(cookie.name)
+        }
+    }
+
+    private var lastLoggedCookieState = ""
+
+    /// Records which Apple Ads cookies the window holds while capture is still waiting, so a sign-in
+    /// that never completes can be diagnosed from the log instead of a spinner. Cookie names only.
+    private func logCookiesIfChanged(_ cookies: [HTTPCookie], url: URL?) {
+        let names = cookies.map(\.name).sorted().joined(separator: ",")
+        let state = "\(url?.host ?? "-")\(url?.path ?? "") [\(names)]"
+        guard state != lastLoggedCookieState else { return }
+        lastLoggedCookieState = state
+        Self.logger.notice("Apple Ads sign-in waiting; page and cookies: \(state, privacy: .public)")
+    }
+
+    /// Decides whether the captured session belongs to the account the user asked for.
+    ///
+    /// This deliberately replaces an earlier keystroke test. Requiring a keystroke rejected every
+    /// legitimate sign-in that does not involve typing — a passkey, Touch ID, Keychain autofill, or
+    /// an Apple session this Mac is already trusted for — so a successful sign-in was captured and
+    /// then thrown away. What actually matters is *which* account came back, not how it got here.
+    private func verifyCapturedAccount(expecting credentials: AppleAdsWebLoginCredentials?) throws {
+        let expected = credentials?.username.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let comparableObserved = observedAccount.flatMap(Self.comparableAccount)
+
+        if !expected.isEmpty,
+           let comparableObserved,
+           let comparableExpected = Self.comparableAccount(expected),
+           comparableObserved != comparableExpected {
+            throw AppleAdsWebLoginError.wrongAccount(
+                signedIn: AppleAdsAccountMask.mask(observedAccount ?? ""),
+                expected: AppleAdsAccountMask.mask(expected)
+            )
+        }
+
+        // Either the account matched, or the user picked one we could not read back. Both are the
+        // user's own choice; only a silent reuse of the Mac's Apple Account is not.
+        if observedAccount != nil || didUseExplicitAccount { return }
+
+        // A saved Apple ID is itself an explicit choice. When Apple reuses the trusted-browser
+        // session this Mac earned on an earlier connect, the page never shows an account field, so
+        // neither signal above fires. The person still chose which account to use, and the
+        // platform-account handoff is already suppressed at the source by the policy script.
+        if !expected.isEmpty { return }
+
+        throw AppleAdsWebLoginError.explicitAccountRequired
+    }
+
+    /// Normalises an Apple ID for comparison, or returns `nil` when Apple only showed a masked form
+    /// such as `h\u{2022}\u{2022}\u{2022}@icloud.com`, which cannot be compared against anything.
+    nonisolated static func comparableAccount(_ account: String) -> String? {
+        let trimmed = account.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return nil }
+        let maskCharacters = CharacterSet(charactersIn: "\u{2022}*\u{2026}")
+        guard trimmed.rangeOfCharacter(from: maskCharacters) == nil else { return nil }
+        return trimmed
+    }
+
+    /// The app's own persistent WebKit store.
+    ///
+    /// Apple hands a short-lived session to a browser it does not recognise. An ephemeral store made
+    /// every connect look like a brand-new browser, which is why sessions died in about a day. A
+    /// store keyed to OpenASO keeps Apple's trusted-browser cookie across launches while staying
+    /// isolated from Safari and from `HTTPCookieStorage.shared`.
+    private static let dataStoreIdentifier = UUID(uuidString: "4B1D9F62-0C3A-4E88-9E2E-0A7F5D6C21B4")!
+
+    static func makeDataStore() -> WKWebsiteDataStore {
+        WKWebsiteDataStore(forIdentifier: dataStoreIdentifier)
+    }
+
+    /// Removes only the Apple Ads session cookies, leaving Apple's sign-in cookies in place.
+    static func clearAppleAdsSessionCookies(in store: WKWebsiteDataStore) async {
+        let cookieStore = store.httpCookieStore
+        for cookie in await cookieStore.allCookies() where appliesToAppleAds(cookie) {
+            await cookieStore.deleteCookie(cookie)
+        }
+    }
+
+    /// Wipes the whole store, trusted-browser cookie included. For an explicit disconnect, where the
+    /// point is that the next sign-in starts from nothing.
+    static func clearPersistedLoginData() async {
+        await makeDataStore().removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+            modifiedSince: .distantPast
         )
     }
 
@@ -198,9 +336,10 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
         }
 
         let configuration = WKWebViewConfiguration()
-        // A fresh cookie jar prevents an earlier account's cookies from satisfying capture before
-        // the current sign-in finishes. The captured session itself is persisted in Keychain.
-        configuration.websiteDataStore = .nonPersistent()
+        // Persistent and app-private: Apple's trusted-browser cookie has to outlive the process for
+        // the Ads session to be long-lived. `captureSession` clears the previous Apple Ads cookies
+        // before loading, so a stale session still cannot satisfy capture early.
+        configuration.websiteDataStore = Self.makeDataStore()
         configuration.userContentController.add(
             self,
             name: Self.explicitAccountMessageHandler
@@ -251,6 +390,7 @@ final class AppleAdsWebLoginController: NSObject, AppleAdsWebLoginCapturing {
         self.window = window
         didCloseWindow = false
         didUseExplicitAccount = false
+        observedAccount = nil
         return webView
     }
 
@@ -307,34 +447,81 @@ enum AppleAdsWebLoginAutomation {
       if (!isAppleOwned || host === "app-ads.apple.com" || window.__openasoExplicitAccountPolicy) return;
       window.__openasoExplicitAccountPolicy = true;
 
-      const disableAutomaticPlatformAccount = () => {
+      const report = (payload) => {
+        try {
+          window.webkit?.messageHandlers?.openASOExplicitAccount?.postMessage(payload);
+        } catch (_) {}
+      };
+
+      // 1. Keep Apple's native "use the Apple Account on this Mac" widget switched off.
+      //
+      // Patching the #embed_login_boot_args element alone is a race Apple can win: the element is
+      // read by an inline script in the same task it is appended, while a MutationObserver callback
+      // only runs at the following microtask checkpoint. Intercepting JSON.parse is synchronous and
+      // catches the read whenever it happens.
+      const scrub = (configuration) => {
+        if (!configuration || typeof configuration !== "object") return configuration;
+        const direct = configuration.direct;
+        if (direct && typeof direct === "object" && "enableTiburonInd" in direct) {
+          direct.enableTiburonInd = false;
+        }
+        return configuration;
+      };
+      const nativeParse = JSON.parse;
+      JSON.parse = function (...parseArguments) {
+        return scrub(nativeParse.apply(this, parseArguments));
+      };
+
+      const patchBootArguments = () => {
         const bootArguments = document.querySelector("#embed_login_boot_args");
         if (!bootArguments || bootArguments.dataset.openasoPatched === "true") return;
         try {
-          const configuration = JSON.parse(bootArguments.textContent || "{}");
+          const configuration = nativeParse(bootArguments.textContent || "{}");
           if (!configuration.direct) return;
           configuration.direct.enableTiburonInd = false;
           bootArguments.textContent = JSON.stringify(configuration);
           bootArguments.dataset.openasoPatched = "true";
         } catch (_) {}
       };
-      const bootObserver = new MutationObserver(disableAutomaticPlatformAccount);
-      bootObserver.observe(document, { childList: true, subtree: true });
-      document.addEventListener("DOMContentLoaded", () => {
-        disableAutomaticPlatformAccount();
-        bootObserver.disconnect();
-      }, { once: true });
 
-      const markExplicitAccount = () => {
-        if (window.__openasoExplicitAccountSelected) return;
-        window.__openasoExplicitAccountSelected = true;
-        window.webkit?.messageHandlers?.openASOExplicitAccount?.postMessage("selected");
+      // 2. Refuse the silent credential handoff.
+      //
+      // Conditional and silent mediation is how the page signs in as the Mac's Apple Account with no
+      // prompt at all. An explicit, user-initiated passkey still works.
+      const credentialStore = navigator.credentials;
+      if (credentialStore && typeof credentialStore.get === "function") {
+        const nativeGet = credentialStore.get.bind(credentialStore);
+        credentialStore.get = (options) => {
+          const mediation = options && options.mediation;
+          if (mediation === "conditional" || mediation === "silent") {
+            return Promise.reject(new DOMException("Suppressed by OpenASO", "NotAllowedError"));
+          }
+          return nativeGet(options);
+        };
+      }
+
+      // 3. Ask Apple for a session that outlives the day.
+      //
+      // Apple only issues a long-lived session when "Keep me signed in" is on. Tick it once, the
+      // moment it renders; if the person signing in unticks it, it stays unticked. Submission is
+      // always theirs.
+      const enableRememberMe = () => {
+        const box = document.querySelector(
+          "input#remember-me, input[name='rememberMe'], input[type='checkbox'][id*='remember' i]"
+        );
+        if (!box || box.dataset.openasoChecked === "true") return;
+        box.dataset.openasoChecked = "true";
+        if (!box.checked) box.click();
       };
-      window.__openasoMarkExplicitAccount = markExplicitAccount;
 
-      document.addEventListener("input", (event) => {
-        const element = event.target;
-        if (!(element instanceof HTMLInputElement)) return;
+      // 4. Record which account is being used.
+      //
+      // Native code compares this against the saved Apple ID. Polling the field value rather than
+      // listening for keystrokes is what makes autofill, Keychain fill, and paste all count.
+      const accountPattern = /account|email|apple.?id|username|phone/;
+      const isAccountField = (element) => {
+        if (!(element instanceof HTMLInputElement)) return false;
+        if (element.type === "password") return false;
         const identity = [
           element.id,
           element.name,
@@ -342,11 +529,41 @@ enum AppleAdsWebLoginAutomation {
           element.autocomplete,
           element.placeholder
         ].join(" ").toLowerCase();
-        if (/account|email|apple.?id|username|phone/.test(identity)) {
+        return accountPattern.test(identity);
+      };
+
+      const markExplicitAccount = () => {
+        if (window.__openasoExplicitAccountSelected) return;
+        window.__openasoExplicitAccountSelected = true;
+        report({ kind: "selected" });
+      };
+      window.__openasoMarkExplicitAccount = markExplicitAccount;
+
+      const reportAccount = () => {
+        for (const field of document.querySelectorAll("input")) {
+          if (!isAccountField(field)) continue;
+          const value = (field.value || "").trim();
+          if (!value || value === window.__openasoReportedAccount) continue;
+          window.__openasoReportedAccount = value;
           markExplicitAccount();
+          report({ kind: "account", account: value });
         }
+      };
+
+      document.addEventListener("input", (event) => {
+        if (isAccountField(event.target)) markExplicitAccount();
       }, true);
 
+      const tick = () => {
+        patchBootArguments();
+        enableRememberMe();
+        reportAccount();
+      };
+      tick();
+      new MutationObserver(tick)
+        .observe(document.documentElement || document, { childList: true, subtree: true });
+      document.addEventListener("DOMContentLoaded", tick, { once: true });
+      window.setInterval(tick, 500);
     })();
     """
 
@@ -404,9 +621,9 @@ enum AppleAdsWebLoginAutomation {
           };
 
           let usernameSubmitted = false;
-          let passwordSubmitted = false;
+          let passwordFilled = false;
           const tick = () => {
-            if (passwordSubmitted) return;
+            if (passwordFilled) return;
 
             const username = firstVisible([
               "input#account_name_text_field",
@@ -431,10 +648,10 @@ enum AppleAdsWebLoginAutomation {
               "input[autocomplete='current-password']"
             ]);
             if (password && fill(password, credentials.password)) {
-              passwordSubmitted = clickButton(
-                ["Sign In", "Log In", "Log in", "Login", "Continue"],
-                ["button#sign-in", "button[type='submit']"]
-              );
+              // Deliberately leave the final submission to the person signing in. Apple's
+              // "Remember me" control can appear or update only after the password field is
+              // populated; clicking submit here made it impossible to opt out before login.
+              passwordFilled = true;
             }
           };
 
@@ -458,7 +675,26 @@ extension AppleAdsWebLoginController: WKScriptMessageHandler {
         didReceive message: WKScriptMessage
     ) {
         guard message.name == Self.explicitAccountMessageHandler else { return }
-        didUseExplicitAccount = true
+
+        guard let payload = message.body as? [String: Any],
+              let kind = payload["kind"] as? String
+        else {
+            // Older payload shape: a bare "selected" string.
+            if message.body as? String == "selected" { didUseExplicitAccount = true }
+            return
+        }
+
+        switch kind {
+        case "selected":
+            didUseExplicitAccount = true
+        case "account":
+            didUseExplicitAccount = true
+            let account = (payload["account"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !account.isEmpty { observedAccount = account }
+        default:
+            break
+        }
     }
 }
 

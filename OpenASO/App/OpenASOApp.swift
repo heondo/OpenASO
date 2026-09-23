@@ -4,7 +4,7 @@ import SwiftUI
 
 @main
 struct OpenASOApp: App {
-    @State private var updaterController = SparkleUpdaterController()
+    private let updaterController: SparkleUpdaterController?
     @State private var launchAlert: AppLaunchAlertContext?
 
     private let startupState: OpenASOStartupState
@@ -13,6 +13,9 @@ struct OpenASOApp: App {
         let executionMode = OpenASOExecutionMode(
             arguments: ProcessInfo.processInfo.arguments
         )
+        updaterController = executionMode == .graphical
+            ? SparkleUpdaterController(startingUpdater: true)
+            : nil
         if executionMode.suppressesApplicationUI {
             _ = NSApplication.shared.setActivationPolicy(.prohibited)
         }
@@ -33,6 +36,19 @@ struct OpenASOApp: App {
 
         self.startupState = startupState
         _launchAlert = State(initialValue: nil)
+
+        // Scheduled refreshes must not depend on a window existing: with the menu bar item the app
+        // can be resident with no main window at all.
+        if executionMode == .graphical,
+           case .ready(_, let services) = startupState,
+           ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            Task { @MainActor in
+                await services.backgroundRefreshAgentController.reconcile(
+                    isEnabled: services.settingsStore.isAutomaticRefreshEnabled
+                )
+                services.startInAppDailyRefreshScheduler()
+            }
+        }
     }
 
     private static func makeStartupState() -> OpenASOStartupState {
@@ -50,8 +66,28 @@ struct OpenASOApp: App {
     }
 
     private static func runBackgroundRefreshAndExit() -> Never {
+        let phaseStore = OneShotWatchdogPhaseStore()
+        let watchdog = OneShotProcessWatchdog()
+        let logFile = OneShotRefreshLogFile.live()
+        watchdog.start(
+            after: BackgroundRefreshDeadlinePolicy.defaultBudget
+                + BackgroundRefreshDeadlinePolicy.defaultCleanupGrace,
+            lastPhase: { phaseStore.current() },
+            write: { message in
+                OneShotRefreshLog.emit(message, logFile: logFile)
+            },
+            terminate: { exitCode in
+                Foundation.exit(exitCode)
+            }
+        )
+        let sink = BackgroundRefreshDiagnosticSink { event in
+            phaseStore.update(from: event)
+            OneShotRefreshLog.emit(event.redactedLogMessage, logFile: logFile)
+        }
         Task { @MainActor in
-            Foundation.exit(await BackgroundRefreshRuntime.runOnce())
+            let exitCode = await BackgroundRefreshRuntime.runOnce(diagnosticSink: sink)
+            watchdog.cancel()
+            Foundation.exit(exitCode)
         }
         RunLoop.main.run()
         fatalError("The background refresh run loop stopped unexpectedly.")
@@ -82,7 +118,7 @@ struct OpenASOApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("OpenASO") {
+        WindowGroup("OpenASO", id: OpenASOWindowID.main) {
             switch startupState {
             case .ready(let modelContainer, let services):
                 RootView()
@@ -91,9 +127,6 @@ struct OpenASOApp: App {
                     .frame(idealWidth: 1000, idealHeight: 760)
                     .task {
                         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
-                            await services.backgroundRefreshAgentController.reconcile(
-                                isEnabled: services.settingsStore.isAutomaticRefreshEnabled
-                            )
                             if services.settingsStore.mcpServerAutostart {
                                 services.mcpServerController.start()
                             }
@@ -146,10 +179,50 @@ struct OpenASOApp: App {
         }
         .commands {
             CommandGroup(after: .appInfo) {
-                Button("Check for Updates...", action: updaterController.checkForUpdates)
+                Button("Check for Updates...") {
+                    updaterController?.checkForUpdates()
+                }
                     .keyboardShortcut("u", modifiers: [.command, .option])
             }
         }
+
+        menuBarScene
+    }
+
+    private var menuBarScene: some Scene {
+        MenuBarExtra(
+            "OpenASO",
+            systemImage: "chart.line.uptrend.xyaxis",
+            isInserted: menuBarIconVisibility
+        ) {
+            menuBarContent
+        }
+    }
+
+    @ViewBuilder
+    private var menuBarContent: some View {
+        if case .ready(let modelContainer, let services) = startupState {
+            MenuBarStatusView()
+                .environment(services)
+                .modelContainer(modelContainer)
+        }
+    }
+
+    /// Stays hidden when the store failed to open, since every line the menu would show comes from
+    /// services that do not exist in that state.
+    ///
+    /// The setting is read eagerly rather than inside the binding's getter so that evaluating the
+    /// scene registers the observation — a getter that only runs later would never retrigger it.
+    private var menuBarIconVisibility: Binding<Bool> {
+        guard case .ready(_, let services) = startupState else {
+            return .constant(false)
+        }
+
+        let showsMenuBarIcon = services.settingsStore.showsMenuBarIcon
+        return Binding(
+            get: { showsMenuBarIcon },
+            set: { services.settingsStore.setShowsMenuBarIcon($0) }
+        )
     }
 
     private static func seedStorefrontCatalogIfNeeded(using services: AppServices) async -> AppLaunchAlertContext? {

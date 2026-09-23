@@ -83,6 +83,22 @@ struct KeywordBackgroundRefreshOutcome: Sendable {
 private struct KeywordRefreshResult: Sendable {
     let outcomes: [KeywordBackgroundRefreshOutcome]
     let metricsError: OpenASOError?
+    let metricsDiagnostics: [AppDetailMetricsDiagnostic]
+}
+
+struct AppDetailMetricsDiagnostic: Hashable, Sendable {
+    enum Code: String, Hashable, Sendable {
+        case appleAdsSessionExpired
+        case providerFailure
+    }
+
+    let code: Code
+    let failureCount: Int
+    let skippedCount: Int
+
+    var isAdvisory: Bool {
+        code == .appleAdsSessionExpired
+    }
 }
 
 private struct RankingPersistenceBatchOutcome: Sendable {
@@ -102,19 +118,22 @@ struct AppDetailRefreshResult: Sendable {
     let reviewOutcomes: [AppStorefrontReviewRefreshOutcome]
     let firstError: OpenASOError?
     let wasCancelled: Bool
+    let metricsDiagnostics: [AppDetailMetricsDiagnostic]
 
     init(
         keywordOutcomes: [KeywordBackgroundRefreshOutcome],
         ratingOutcomes: [AppStorefrontRatingRefreshOutcome],
         reviewOutcomes: [AppStorefrontReviewRefreshOutcome],
         firstError: OpenASOError?,
-        wasCancelled: Bool = false
+        wasCancelled: Bool = false,
+        metricsDiagnostics: [AppDetailMetricsDiagnostic] = []
     ) {
         self.keywordOutcomes = keywordOutcomes
         self.ratingOutcomes = ratingOutcomes
         self.reviewOutcomes = reviewOutcomes
         self.firstError = firstError
         self.wasCancelled = wasCancelled
+        self.metricsDiagnostics = metricsDiagnostics
     }
 
     static let cancelled = AppDetailRefreshResult(
@@ -122,7 +141,8 @@ struct AppDetailRefreshResult: Sendable {
         ratingOutcomes: [],
         reviewOutcomes: [],
         firstError: nil,
-        wasCancelled: true
+        wasCancelled: true,
+        metricsDiagnostics: []
     )
 }
 
@@ -349,7 +369,8 @@ final class AppDetailRefreshService: Sendable {
                     keywordOutcomes: keywordRefreshResult.outcomes,
                     ratingOutcomes: ratingOutcomes,
                     reviewOutcomes: reviewOutcomes,
-                    firstError: firstError
+                    firstError: firstError,
+                    metricsDiagnostics: keywordRefreshResult.metricsDiagnostics
                 )
             } catch {
                 if Task.isCancelled {
@@ -384,7 +405,7 @@ final class AppDetailRefreshService: Sendable {
             await recordStage(.rankings, attemptedCount: 0, failureCount: 0, isSkipped: true)
             await recordStage(.keywordMetrics, attemptedCount: 0, failureCount: 0, isSkipped: true)
             try Task.checkCancellation()
-            return KeywordRefreshResult(outcomes: [], metricsError: nil)
+            return KeywordRefreshResult(outcomes: [], metricsError: nil, metricsDiagnostics: [])
         }
 
         var didRecordRankingStage = false
@@ -443,6 +464,7 @@ final class AppDetailRefreshService: Sendable {
             try Task.checkCancellation()
 
             let metricsError: OpenASOError?
+            let metricsDiagnostics: [AppDetailMetricsDiagnostic]
             if request.refreshMetrics {
                 if updatesPhase {
                     await progressStore?.updatePhase(.refreshingMetrics)
@@ -472,10 +494,32 @@ final class AppDetailRefreshService: Sendable {
                     await recordStage(
                         .keywordMetrics,
                         attemptedCount: metricResult.outcomes.count,
-                        failureCount: metricResult.failureCount
+                        failureCount: metricResult.operationalFailureCount,
+                        isSkipped: metricResult.skippedCount == metricResult.outcomes.count
+                            && metricResult.operationalFailureCount == 0
                     )
                     try Task.checkCancellation()
-                    metricsError = metricResult.firstErrorMessage.map(OpenASOError.providerUnavailable)
+                    metricsError = metricResult.firstOperationalErrorMessage.map(
+                        OpenASOError.providerUnavailable
+                    )
+                    var diagnostics: [AppDetailMetricsDiagnostic] = []
+                    if metricResult.batchErrors.contains(where: {
+                        $0.code == .appleAdsSessionExpired
+                    }) {
+                        diagnostics.append(AppDetailMetricsDiagnostic(
+                            code: .appleAdsSessionExpired,
+                            failureCount: 0,
+                            skippedCount: metricResult.skippedCount
+                        ))
+                    }
+                    if metricResult.operationalFailureCount > 0 {
+                        diagnostics.append(AppDetailMetricsDiagnostic(
+                            code: .providerFailure,
+                            failureCount: metricResult.operationalFailureCount,
+                            skippedCount: metricResult.skippedCount
+                        ))
+                    }
+                    metricsDiagnostics = diagnostics
                 } catch {
                     if Task.isCancelled {
                         throw CancellationError()
@@ -495,6 +539,11 @@ final class AppDetailRefreshService: Sendable {
                         failureCount: attemptedCount > 0 ? 1 : 0
                     )
                     metricsError = mappedError
+                    metricsDiagnostics = [AppDetailMetricsDiagnostic(
+                        code: .providerFailure,
+                        failureCount: max(1, attemptedCount),
+                        skippedCount: 0
+                    )]
                 }
                 didRecordMetricsStage = true
             } else {
@@ -502,12 +551,14 @@ final class AppDetailRefreshService: Sendable {
                 await recordStage(.keywordMetrics, attemptedCount: 0, failureCount: 0, isSkipped: true)
                 didRecordMetricsStage = true
                 metricsError = nil
+                metricsDiagnostics = []
             }
 
             try Task.checkCancellation()
             return KeywordRefreshResult(
                 outcomes: combinedKeywordOutcomes,
-                metricsError: metricsError
+                metricsError: metricsError,
+                metricsDiagnostics: metricsDiagnostics
             )
         } catch {
             if Task.isCancelled {
@@ -540,7 +591,8 @@ final class AppDetailRefreshService: Sendable {
                 outcomes: request.trackIdentityKeys.map {
                     KeywordBackgroundRefreshOutcome(trackIdentityKey: $0, error: mappedError)
                 },
-                metricsError: nil
+                metricsError: nil,
+                metricsDiagnostics: []
             )
         }
     }

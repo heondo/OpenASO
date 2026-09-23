@@ -2,6 +2,17 @@ import Foundation
 
 enum SearchRankingCrawl {
     static let fullKeywordRankingLimit = 200
+
+    /// iTunes `/lookup` occasionally omits a handful of requested app IDs
+    /// (delisted apps, region restrictions, entity-type mismatches) even when
+    /// the search page itself was healthy. Hydration drops those rows instead
+    /// of failing the whole page, tolerating up to 10% of the requested IDs
+    /// with an absolute floor of 2 so small requests can lose an ID too. A
+    /// shortfall above this tolerance (or a lookup that hydrates nothing)
+    /// still fails with `.lookupHydrationIncomplete`.
+    static func hydrationMissingIDTolerance(requestedCount: Int) -> Int {
+        max(2, requestedCount / 10)
+    }
 }
 
 struct ResolvedApp: Identifiable, Hashable, Sendable {

@@ -37,6 +37,89 @@ actor RankingMetadataEnrichmentWorkQueue {
     }
 }
 
+/// Owns the in-app daily refresh loop and the one rule that keeps it safe to reconfigure: a refresh
+/// that is already running is never cancelled.
+///
+/// The daily claim is persisted before any work begins, so a cancelled run does not retry — it
+/// burns the day. A schedule change therefore waits for the running refresh instead of restarting
+/// the loop underneath it; the loop re-reads the saved schedule on its next iteration anyway, so
+/// the restart only matters for a loop that is sleeping or has exited.
+@MainActor
+final class InAppDailyRefreshSchedulerSupervisor {
+    private let runLoop: @MainActor () async -> Void
+    private var task: Task<Void, Never>?
+    private var isRefreshInFlight = false
+    private var didClaimDuringFlight = false
+    private var hasPendingRestart = false
+
+    init(runLoop: @escaping @MainActor () async -> Void) {
+        self.runLoop = runLoop
+    }
+
+    func start() {
+        guard task == nil else { return }
+        task = Task { @MainActor [runLoop] in
+            await runLoop()
+        }
+    }
+
+    func restart() {
+        guard !isRefreshInFlight else {
+            hasPendingRestart = true
+            return
+        }
+
+        task?.cancel()
+        task = nil
+        start()
+    }
+
+    /// Marks the flight as having committed the day, which is what makes it unsafe to cancel.
+    func markRefreshClaimed() {
+        didClaimDuringFlight = true
+    }
+
+    func withRefreshInFlight<Value>(
+        _ operation: @MainActor () async -> Value
+    ) async -> Value {
+        isRefreshInFlight = true
+        didClaimDuringFlight = false
+        defer {
+            let didClaim = didClaimDuringFlight
+            isRefreshInFlight = false
+            didClaimDuringFlight = false
+            honourPendingRestart(didClaim: didClaim)
+        }
+        return await operation()
+    }
+
+    private func honourPendingRestart(didClaim: Bool) {
+        guard hasPendingRestart else { return }
+        hasPendingRestart = false
+
+        // Nothing was claimed and nothing ran, so there is nothing to lose by replacing the loop —
+        // and it must be replaced, because it is about to sleep on a stale schedule.
+        guard didClaim else {
+            restart()
+            return
+        }
+
+        guard let runningTask = task else {
+            start()
+            return
+        }
+
+        // Cancelling here would cancel the very iteration that just finished the refresh, so the
+        // loop is left to continue and only a loop that exits on its own is revived.
+        Task { @MainActor [weak self] in
+            await runningTask.value
+            guard let self, self.task == runningTask else { return }
+            self.task = nil
+            self.start()
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class AppServices {
@@ -84,6 +167,7 @@ final class AppServices {
     let keywordResearchMetricsWorkflow: KeywordResearchMetricsWorkflow?
     private(set) var backgroundModelStore: BackgroundModelStore?
     private(set) var backgroundModelStoreRevision = 0
+    private var inAppDailyRefreshSchedulerSupervisor: InAppDailyRefreshSchedulerSupervisor?
 
     init(
         httpClient: HTTPClient = URLSessionHTTPClient(),
@@ -475,39 +559,17 @@ final class AppServices {
             )
             self.dailyRefreshScheduler = DailyRefreshScheduler(
                 runIteration: { [weak self] date, calendar in
-                    do {
-                        let attempt = try await dailyRefreshLock.attempt {
-                            let evaluation = await settingsStore
-                                .evaluateAndClaimAutomaticRefresh(
-                                    at: date,
-                                    calendar: calendar
-                                )
-                            if let claim = evaluation.claim, !Task.isCancelled {
-                                _ = await self?.runAutomaticHeadlessRefresh(
-                                    HeadlessRefreshRunRequest(
-                                        scheduledFor: claim.scheduledFor,
-                                        refreshRatingsAndReviews: claim
-                                            .refreshRatingsAndReviews
-                                    )
-                                )
-                            }
-                            return DailyRefreshSchedulerIteration(
-                                nextCheckAt: evaluation.nextCheckAt
-                            )
-                        }
-                        switch attempt {
-                        case .acquired(let iteration):
-                            return iteration
-                        case .unavailable:
-                            return DailyRefreshSchedulerIteration(
-                                nextCheckAt: date.addingTimeInterval(60)
-                            )
-                        }
-                    } catch {
-                        return DailyRefreshSchedulerIteration(
-                            nextCheckAt: date.addingTimeInterval(15 * 60)
-                        )
+                    // Outside the flight and the daily lock: repairing the launchd registration is
+                    // not refresh work and must not be serialized against the one-shot process.
+                    await self?.backgroundRefreshAgentController.repairIfStale(now: date)
+                    guard let self else {
+                        return DailyRefreshSchedulerIteration(nextCheckAt: nil)
                     }
+                    return await self.runDailyRefreshIteration(
+                        at: date,
+                        calendar: calendar,
+                        lock: dailyRefreshLock
+                    )
                 }
             )
         }
@@ -518,6 +580,91 @@ final class AppServices {
 
     func prepareBackgroundModelStore() async {
         await backgroundModelStore?.prepare()
+    }
+
+    /// Runs the in-app scheduler for as long as the process lives, independently of any window.
+    /// Calling it again while the loop is running is a no-op.
+    ///
+    /// It stays on whatever the launchd agent reports: the agent can be `.enabled` and still never
+    /// launch, and the two paths already exclude each other through the shared daily lock.
+    func startInAppDailyRefreshScheduler() {
+        guard let dailyRefreshScheduler else { return }
+
+        let supervisor = inAppDailyRefreshSchedulerSupervisor
+            ?? InAppDailyRefreshSchedulerSupervisor {
+                await dailyRefreshScheduler.run()
+            }
+        inAppDailyRefreshSchedulerSupervisor = supervisor
+        supervisor.start()
+    }
+
+    /// `DailyRefreshScheduler.run()` returns for good once the schedule is disabled, and it can be
+    /// asleep for up to an hour, so every change to the schedule needs a fresh loop.
+    func restartInAppDailyRefreshScheduler() {
+        guard let inAppDailyRefreshSchedulerSupervisor else {
+            startInAppDailyRefreshScheduler()
+            return
+        }
+
+        inAppDailyRefreshSchedulerSupervisor.restart()
+    }
+
+    /// One scheduler tick.
+    ///
+    /// The claim and the refresh are one indivisible flight: `evaluateAndClaimAutomaticRefresh`
+    /// persists the day before any work begins, so a restart landing between the claim and the
+    /// refresh burns the day exactly as cancelling the refresh itself would. The flight is marked
+    /// outside the daily lock, so a restart that does replace the loop cannot race the new loop for
+    /// a lock this one still holds.
+    private func runDailyRefreshIteration(
+        at date: Date,
+        calendar: Calendar,
+        lock: CrossProcessFileLock
+    ) async -> DailyRefreshSchedulerIteration {
+        await withDailyRefreshFlight {
+            do {
+                let attempt = try await lock.attempt {
+                    let evaluation = self.settingsStore.evaluateAndClaimAutomaticRefresh(
+                        at: date,
+                        calendar: calendar
+                    )
+                    if let claim = evaluation.claim, !Task.isCancelled {
+                        self.inAppDailyRefreshSchedulerSupervisor?.markRefreshClaimed()
+                        _ = await self.runAutomaticHeadlessRefresh(
+                            HeadlessRefreshRunRequest(
+                                scheduledFor: claim.scheduledFor,
+                                refreshRatingsAndReviews: claim.refreshRatingsAndReviews
+                            )
+                        )
+                    }
+                    return DailyRefreshSchedulerIteration(
+                        nextCheckAt: evaluation.nextCheckAt
+                    )
+                }
+                switch attempt {
+                case .acquired(let iteration):
+                    return iteration
+                case .unavailable:
+                    return DailyRefreshSchedulerIteration(
+                        nextCheckAt: date.addingTimeInterval(60)
+                    )
+                }
+            } catch {
+                return DailyRefreshSchedulerIteration(
+                    nextCheckAt: date.addingTimeInterval(15 * 60)
+                )
+            }
+        }
+    }
+
+    private func withDailyRefreshFlight<Value>(
+        _ operation: @MainActor () async -> Value
+    ) async -> Value {
+        guard let inAppDailyRefreshSchedulerSupervisor else {
+            return await operation()
+        }
+
+        return await inAppDailyRefreshSchedulerSupervisor.withRefreshInFlight(operation)
     }
 
     func markBackgroundModelStoreChanged() {
@@ -566,13 +713,6 @@ final class AppServices {
         let summary = await headlessRefreshService.run(request)
         recordHeadlessRefreshCompletion(summary)
         return summary
-    }
-
-    var inAppDailyRefreshConfiguration: InAppDailyRefreshConfiguration {
-        InAppDailyRefreshConfiguration(
-            schedule: settingsStore.scheduleConfiguration,
-            agentStatus: backgroundRefreshAgentController.status
-        )
     }
 
     func observeHeadlessRefreshes() async {
@@ -672,6 +812,29 @@ final class AppServices {
         }
 
         return AppServices(backgroundModelStore: backgroundModelStore)
+    }
+
+    /// Constructs the one-shot service graph from exactly the dependencies selected by the
+    /// runtime. Unlike `appLaunch`, this never swaps in preview defaults under XCTest and never
+    /// permits an authentication UI from the login Keychain.
+    static func backgroundRefresh(
+        defaults: UserDefaults = .openASOShared,
+        namespace: AppNamespace = .current,
+        keychain: any KeychainService = SystemKeychainService(
+            interactionPolicy: .noninteractive
+        ),
+        httpClient: HTTPClient = URLSessionHTTPClient(),
+        modelContainer: ModelContainer
+    ) -> AppServices {
+        AppServices(
+            httpClient: httpClient,
+            defaults: defaults,
+            keychain: keychain,
+            namespace: namespace,
+            loadsEnvironmentCredentials: false,
+            allowsIconNetworkFetches: false,
+            backgroundModelStore: BackgroundModelStore(modelContainer: modelContainer)
+        )
     }
 }
 

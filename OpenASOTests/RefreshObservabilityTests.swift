@@ -511,7 +511,9 @@ struct RefreshObservabilityTests {
     }
 
     @Test
-    func appDetailMetricsExpiryRecordsOneFailureWithoutRewritingRankingOutcomes() async throws {
+    /// Session expiry is surfaced through the persistent Settings/cell state, not counted as an
+    /// operational failure of the app refresh, so the summary stays clean and the rankings stand.
+    func appDetailMetricsExpiryIsNotAnOperationalFailureAndKeepsRankingOutcomes() async throws {
         let httpClient = RankingAndExpiredAppleAdsHTTPClient()
         let session = AppleAdsWebSession(
             cookieHeader: "cookie=value; XSRF-TOKEN-CM=token",
@@ -534,19 +536,77 @@ struct RefreshObservabilityTests {
             appleAdsWebSession: session
         )
 
-        let result = await fixture.service.refresh(fixture.request)
+        let parentRunID = UUID()
+        let result = await RefreshObservationScope.$parentHeadlessRunID.withValue(parentRunID) {
+            await RefreshObservationScope.$appStoreID.withValue(fixture.request.app.appStoreID) {
+                await fixture.service.refresh(fixture.request)
+            }
+        }
         let summary = try #require(await fixture.recorder.completedSummaries().only)
         let rankings = try #require(summary.stages[.rankings])
         let metrics = try #require(summary.stages[.keywordMetrics])
 
         #expect(result.keywordOutcomes.count == 3)
         #expect(result.keywordOutcomes.allSatisfy { $0.error == nil })
-        #expect(result.firstError?.localizedDescription.contains(AppleAdsWebSessionExpiredError.message) == true)
+        #expect(result.firstError == nil)
+        #expect(result.metricsDiagnostics == [AppDetailMetricsDiagnostic(
+            code: .appleAdsSessionExpired,
+            failureCount: 0,
+            skippedCount: 3
+        )])
         #expect(rankings.attemptedCount == 3)
         #expect(rankings.failureCount == 0)
         #expect(metrics.attemptedCount == 3)
-        #expect(metrics.failureCount == 1)
-        #expect(summary.result == .partialFailure)
+        #expect(metrics.failureCount == 0)
+        #expect(summary.result == .success)
+        #expect(summary.parentHeadlessRunID == parentRunID)
+        #expect(summary.appStoreID == fixture.request.app.appStoreID)
+        #expect(summary.providers[.appleAdsWeb]?.resultCounts[.authenticationFailure] == 1)
+
+        let successfulMetadata = AppMetadataRefreshResult(
+            appStoreID: fixture.request.app.appStoreID,
+            defaultStorefront: "us",
+            storefronts: [AppMetadataRefreshStorefrontOutcome(
+                storefront: "us",
+                iTunesLookup: .succeeded,
+                appStoreWeb: .succeeded
+            )],
+            iconInvalidated: false
+        )
+        let advisoryOnly = HeadlessRefreshAppResultAdapter.map(
+            metadataResult: successfulMetadata,
+            metadataStatus: successfulMetadata.status,
+            detailResult: result,
+            request: fixture.request
+        )
+        #expect(advisoryOnly.disposition == .success)
+        #expect(advisoryOnly.diagnostics.map(\.severity) == [.advisory])
+        #expect(advisoryOnly.diagnostics.map(\.reasonCode) == [.sessionExpired])
+
+        let metadataFailure = AppMetadataRefreshFailure(
+            provider: .appStoreWeb,
+            stage: .validation,
+            error: .unexpectedResponse
+        )
+        let partialMetadata = AppMetadataRefreshResult(
+            appStoreID: fixture.request.app.appStoreID,
+            defaultStorefront: "us",
+            storefronts: [AppMetadataRefreshStorefrontOutcome(
+                storefront: "us",
+                iTunesLookup: .succeeded,
+                appStoreWeb: .failed(metadataFailure)
+            )],
+            iconInvalidated: false
+        )
+        let independentFailure = HeadlessRefreshAppResultAdapter.map(
+            metadataResult: partialMetadata,
+            metadataStatus: partialMetadata.status,
+            detailResult: result,
+            request: fixture.request
+        )
+        #expect(independentFailure.disposition == .partialFailure)
+        #expect(independentFailure.diagnostics.map(\.severity) == [.failure, .advisory])
+        #expect(independentFailure.diagnostics.map(\.reasonCode) == [.validationFailed, .sessionExpired])
         // The fixture returns iTunes JSON for both ranking hosts, so every
         // web parse fails safely and falls back to the iTunes provider.
         #expect(await httpClient.rankingRequestCount() == 6)

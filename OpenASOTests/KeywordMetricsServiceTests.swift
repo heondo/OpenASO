@@ -4,8 +4,25 @@ import Synchronization
 import Testing
 @testable import OpenASO
 
+private enum KeywordMetricsRotationTestError: Error, Equatable {
+    case laterBatch
+}
+
 @MainActor
 struct KeywordMetricsServiceTests {
+    @Test
+    func expiredSessionIsAnAdvisoryForInteractiveRefreshAndAnErrorForMCP() {
+        let result = KeywordMetricsRefreshBatchResult(
+            outcomes: [],
+            batchErrors: [.appleAdsSessionExpired]
+        )
+
+        #expect(result.failureCount == 1)
+        #expect(result.firstErrorMessage == AppleAdsWebSessionExpiredError.message)
+        #expect(result.operationalFailureCount == 0)
+        #expect(result.firstOperationalErrorMessage == nil)
+    }
+
     @Test
     func expiredRefreshPreservesExistingPopularityAndRequiresReconnect() async throws {
         let container = try ModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
@@ -169,7 +186,10 @@ struct KeywordMetricsServiceTests {
                 #expect(url.host == "app-ads.apple.com")
                 #expect(url.path == "/reporting/graphql")
                 #expect(request.httpMethod == "POST")
-                #expect(request.value(forHTTPHeaderField: "Cookie") == "searchads.soid=session")
+                #expect(
+                    request.value(forHTTPHeaderField: "Cookie")
+                        == "XSRF-TOKEN-CM=xsrf; searchads.soid=session"
+                )
                 #expect(request.value(forHTTPHeaderField: "X-XSRF-TOKEN-CM") == "xsrf")
 
                 let payload = """
@@ -201,7 +221,7 @@ struct KeywordMetricsServiceTests {
         )
         try services.appleAdsWebSessionStore.save(
             AppleAdsWebSession(
-                cookieHeader: "searchads.soid=session",
+                cookieHeader: "searchads.soid=session; XSRF-TOKEN-CM=xsrf",
                 xsrfToken: "xsrf",
                 updatedAt: .now
             )
@@ -541,7 +561,10 @@ struct KeywordMetricsServiceTests {
                     .queryItems?.first(where: { $0.name == "adamId" })?.value
                     == String(contextAppStoreID)
             )
-            #expect(request.value(forHTTPHeaderField: "Cookie") == session.cookieHeader)
+            #expect(
+                request.value(forHTTPHeaderField: "Cookie")
+                    == "XSRF-TOKEN-CM=token; cookie=value"
+            )
             #expect(request.value(forHTTPHeaderField: "X-XSRF-TOKEN-CM") == session.xsrfToken)
             let body = try #require(request.httpBody)
             let requestBody = try JSONDecoder().decode(KeywordPopularityRequestBody.self, from: body)
@@ -556,7 +579,8 @@ struct KeywordMetricsServiceTests {
         }
         let service = makeKeywordMetricsService(
             httpClient: client,
-            freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder()
+            freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder(),
+            seededWebSession: session
         )
         let backgroundModelStore = BackgroundModelStore(modelContainer: container)
 
@@ -888,6 +912,219 @@ struct KeywordMetricsServiceTests {
         #expect(
             try await backgroundModelStore.fetchCount(FetchDescriptor<KeywordDailyMetric>()) == 0
         )
+    }
+
+    @Test
+    func rotatedCookiePersistsWhenALaterPopularityBatchThrowsOriginalError() async throws {
+        let defaultsName = "KeywordMetricsRotationError.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: defaultsName))
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let namespace = AppNamespace(bundleIdentifier: defaultsName)
+        let keychain = InMemoryKeychainService()
+        let store = AppleAdsWebSessionStore(
+            defaults: defaults,
+            keychain: keychain,
+            namespace: namespace
+        )
+        let session = completeWebSession
+        try store.save(session)
+        let requestCount = Mutex(0)
+        let client = MockHTTPClient { request in
+            let count = requestCount.withLock { value -> Int in
+                value += 1
+                return value
+            }
+            if count == 2 {
+                throw KeywordMetricsRotationTestError.laterBatch
+            }
+            let body = try JSONDecoder().decode(
+                KeywordPopularityRequestBody.self,
+                from: try #require(request.httpBody)
+            )
+            let entries = body.terms.map {
+                #"{"name":"\#($0)","popularity":61}"#
+            }.joined(separator: ",")
+            return (
+                Data(#"{"status":"success","data":[\#(entries)]}"#.utf8),
+                makeHTTPURLResponse(
+                    url: try #require(request.url),
+                    statusCode: 200,
+                    headerFields: ["Set-Cookie": "searchads.soid=rotated; Path=/"]
+                )
+            )
+        }
+        let service = KeywordMetricsService(
+            httpClient: client,
+            credentialStore: AppleAdsCredentialStore(
+                defaults: defaults,
+                keychain: keychain,
+                namespace: namespace,
+                loadsEnvironmentCredentials: false
+            ),
+            settingsStore: AppSettingsStore(defaults: defaults),
+            webSessionStore: store
+        )
+        let targets = try (0..<101).map {
+            try makePopularityTarget(term: "rotation-error-\($0)", storefront: "us")
+        }
+
+        await #expect(throws: KeywordMetricsRotationTestError.laterBatch) {
+            _ = try await service.fetchPopularityMetrics(
+                for: targets,
+                contextAppStoreID: 123_456_789,
+                webSession: session
+            )
+        }
+
+        #expect(requestCount.withLock { $0 } == 2)
+        #expect(store.session?.cookieHeader.contains("searchads.soid=rotated") == true)
+        let reopened = AppleAdsWebSessionStore(
+            defaults: defaults,
+            keychain: keychain,
+            namespace: namespace
+        )
+        #expect(reopened.cookieJar.cookieHeader(
+            for: URL(string: "https://app-ads.apple.com/cm/api/v2/keywords/popularities")!
+        ).contains("searchads.soid=rotated"))
+    }
+
+    @Test
+    func rotatedCookiePersistsWhenTrackedMetricsBatchIsCancelledLater() async throws {
+        let container = try ModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
+        let context = ModelContext(container)
+        let defaultsName = "KeywordMetricsRotationCancellation.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: defaultsName))
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let namespace = AppNamespace(bundleIdentifier: defaultsName)
+        let keychain = InMemoryKeychainService()
+        let store = AppleAdsWebSessionStore(
+            defaults: defaults,
+            keychain: keychain,
+            namespace: namespace
+        )
+        let session = completeWebSession
+        try store.save(session)
+        let requestCount = Mutex(0)
+        let client = MockHTTPClient { request in
+            let count = requestCount.withLock { value -> Int in
+                value += 1
+                return value
+            }
+            if count == 2 { throw CancellationError() }
+            let body = try JSONDecoder().decode(
+                KeywordPopularityRequestBody.self,
+                from: try #require(request.httpBody)
+            )
+            let entries = body.terms.map {
+                #"{"name":"\#($0)","popularity":62}"#
+            }.joined(separator: ",")
+            return (
+                Data(#"{"status":"success","data":[\#(entries)]}"#.utf8),
+                makeHTTPURLResponse(
+                    url: try #require(request.url),
+                    statusCode: 200,
+                    headerFields: ["Set-Cookie": "searchads.soid=rotated-cancel; Path=/"]
+                )
+            )
+        }
+        let service = KeywordMetricsService(
+            httpClient: client,
+            credentialStore: AppleAdsCredentialStore(
+                defaults: defaults,
+                keychain: keychain,
+                namespace: namespace,
+                loadsEnvironmentCredentials: false
+            ),
+            settingsStore: AppSettingsStore(defaults: defaults),
+            webSessionStore: store
+        )
+        let app = TrackedApp(
+            appStoreID: 1,
+            bundleID: nil,
+            name: "App",
+            sellerName: nil,
+            defaultPlatform: .iphone
+        )
+        context.insert(app)
+        let tracks = try (0..<101).map {
+            try makeTrack(term: "rotation-cancel-\($0)", trackedApp: app, in: context)
+        }
+        try context.save()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await service.refreshMetricsBatch(
+                for: tracks.map(\.identityKey),
+                popularityContextAppStoreID: 123_456_789,
+                webSession: session,
+                using: BackgroundModelStore(modelContainer: container)
+            )
+        }
+
+        #expect(requestCount.withLock { $0 } == 2)
+        #expect(store.session?.cookieHeader.contains("searchads.soid=rotated-cancel") == true)
+    }
+
+    @Test
+    func popularityTreats200JSONErrorMalformedJSONAndMissingKeywordSeparately() async throws {
+        let target = try makePopularityTarget(term: "focus", storefront: "us")
+
+        do {
+            let service = makeKeywordMetricsService(
+                httpClient: MockHTTPClient { request in
+                    (
+                        Data(#"{"status":"success","data":[],"error":{"errors":[{"message":"provider rejected request"}]}}"#.utf8),
+                        makeHTTPURLResponse(url: try #require(request.url), statusCode: 200)
+                    )
+                },
+                freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder(),
+                seededWebSession: completeWebSession
+            )
+            await #expect(throws: OpenASOError.self) {
+                _ = try await service.fetchPopularityMetrics(
+                    for: [target],
+                    contextAppStoreID: 123,
+                    webSession: completeWebSession
+                )
+            }
+        }
+
+        do {
+            let service = makeKeywordMetricsService(
+                httpClient: MockHTTPClient { request in
+                    (
+                        Data("{malformed".utf8),
+                        makeHTTPURLResponse(url: try #require(request.url), statusCode: 200)
+                    )
+                },
+                freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder(),
+                seededWebSession: completeWebSession
+            )
+            await #expect(throws: DecodingError.self) {
+                _ = try await service.fetchPopularityMetrics(
+                    for: [target],
+                    contextAppStoreID: 123,
+                    webSession: completeWebSession
+                )
+            }
+        }
+
+        let missingService = makeKeywordMetricsService(
+            httpClient: MockHTTPClient { request in
+                (
+                    Data(#"{"status":"success","data":[]}"#.utf8),
+                    makeHTTPURLResponse(url: try #require(request.url), statusCode: 200)
+                )
+            },
+            freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder(),
+            seededWebSession: completeWebSession
+        )
+        let missing = try await missingService.fetchPopularityMetrics(
+            for: [target],
+            contextAppStoreID: 123,
+            webSession: completeWebSession
+        )
+        #expect(missing.count == 1)
+        #expect(missing.first?.popularityScore == nil)
     }
 
     @Test
@@ -1982,9 +2219,13 @@ struct KeywordMetricsServiceTests {
     private func makeKeywordMetricsService(
         httpClient: HTTPClient,
         freshnessFetchRecorder: KeywordMetricsFreshnessFetchRecorder,
-        bulkFreshnessFetchHook: @escaping @Sendable () throws -> Void = {}
+        bulkFreshnessFetchHook: @escaping @Sendable () throws -> Void = {},
+        seededWebSession: AppleAdsWebSession? = nil
     ) -> KeywordMetricsService {
         let dependencies = AppServices.mocked(httpClient: httpClient)
+        if let seededWebSession {
+            try! dependencies.appleAdsWebSessionStore.save(seededWebSession)
+        }
         return KeywordMetricsService(
             httpClient: httpClient,
             credentialStore: dependencies.appleAdsCredentialStore,

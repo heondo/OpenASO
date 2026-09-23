@@ -27,6 +27,8 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
     let finishedAt: Date?
     let facts: String?
     let issueMessage: String?
+    let diagnosticMessages: [String]
+    let reconnectAdvisory: String?
     let accessibilityLabel: String
     let accessibilityValue: String
 
@@ -110,6 +112,8 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
         self.finishedAt = nil
         self.facts = nil
         self.issueMessage = nil
+        self.diagnosticMessages = []
+        self.reconnectAdvisory = nil
         self.accessibilityLabel = "Automatic refresh progress"
         self.accessibilityValue = detail
     }
@@ -162,7 +166,13 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
             + "\(latestRun.successfulAppCount) succeeded, "
             + "\(latestRun.partialFailureAppCount) partial, "
             + "\(latestRun.failedAppCount) failed."
-        let issueMessage = latestRun.issue?.message
+        let failureDiagnostics = latestRun.diagnostics.filter { $0.severity == .failure }
+        let advisoryDiagnostics = latestRun.diagnostics.filter { $0.severity == .advisory }
+        let diagnosticMessages = Array(Set(failureDiagnostics.map(\.safeMessage))).sorted()
+        let reconnectAdvisory = advisoryDiagnostics.first(where: {
+            $0.reasonCode == .sessionExpired || $0.reasonCode == .popularitySkipped
+        })?.safeMessage
+        let issueMessage = diagnosticMessages.first ?? latestRun.issue?.message
         let finishedText = latestRun.finishedAt.formatted(
             date: .abbreviated,
             time: .shortened
@@ -173,6 +183,7 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
             "Finished \(finishedText).",
             facts,
             issueMessage,
+            reconnectAdvisory,
         ]
         let accessibilityValue = accessibilityParts
             .compactMap { $0 }
@@ -187,6 +198,8 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
         self.finishedAt = latestRun.finishedAt
         self.facts = facts
         self.issueMessage = issueMessage
+        self.diagnosticMessages = diagnosticMessages
+        self.reconnectAdvisory = reconnectAdvisory
         self.accessibilityLabel = "Latest automatic refresh result this session"
         self.accessibilityValue = accessibilityValue
     }
@@ -248,12 +261,20 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
             date: .abbreviated,
             time: .shortened
         )
+        let failureDiagnostics = persistedRun.diagnostics.filter { $0.severity == .failure }
+        let advisoryDiagnostics = persistedRun.diagnostics.filter { $0.severity == .advisory }
+        let diagnosticMessages = Array(Set(failureDiagnostics.map(\.safeMessage))).sorted()
+        let reconnectAdvisory = advisoryDiagnostics.first(where: {
+            $0.reasonCode == .sessionExpired || $0.reasonCode == .popularitySkipped
+        })?.safeMessage
+        let issueMessage = diagnosticMessages.first ?? persistedRun.issueMessage
         let accessibilityValue = [
             result.title + ".",
             result.detail,
             "Finished \(finishedText).",
             facts,
-            persistedRun.issueMessage,
+            issueMessage,
+            reconnectAdvisory,
         ]
         .compactMap { $0 }
         .joined(separator: " ")
@@ -266,7 +287,9 @@ struct DailyRefreshRunStatusPresentation: Equatable, Sendable {
         self.resultHeading = "Latest background result"
         self.finishedAt = persistedRun.finishedAt
         self.facts = facts
-        self.issueMessage = persistedRun.issueMessage
+        self.issueMessage = issueMessage
+        self.diagnosticMessages = diagnosticMessages
+        self.reconnectAdvisory = reconnectAdvisory
         self.accessibilityLabel = "Latest automatic refresh result"
         self.accessibilityValue = accessibilityValue
     }
@@ -366,6 +389,18 @@ private extension DailyRefreshRunStatusView {
 
                 if let issueMessage = presentation.issueMessage {
                     Label(issueMessage, systemImage: "exclamationmark.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach(Array(presentation.diagnosticMessages.dropFirst()), id: \.self) { diagnosticMessage in
+                    Label(diagnosticMessage, systemImage: "exclamationmark.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let reconnectAdvisory = presentation.reconnectAdvisory {
+                    Label(reconnectAdvisory, systemImage: "person.crop.circle.badge.exclamationmark")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }

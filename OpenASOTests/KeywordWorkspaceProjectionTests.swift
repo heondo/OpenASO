@@ -688,7 +688,7 @@ struct KeywordWorkspaceProjectionTests {
         let revisionBeforeUpdate = model.contentRevision
         let updatedAt = Date(timeIntervalSince1970: 2_100_000_000)
 
-        model.applyUpdatedRows([
+        await model.applyUpdatedRows([
             focusRow.id: KeywordInsightsService.Workspace.Row(
                 metrics: KeywordMetricsSnapshot(
                     popularityScore: 99,
@@ -778,7 +778,7 @@ struct KeywordWorkspaceProjectionTests {
         )
 
         #expect(model.sortCount == 2)
-        #expect(model.tableIdentity == 2)
+        #expect(model.tableIdentity == 1)
         #expect(model.rows.first?.id == updatedFirstRow.id)
     }
 

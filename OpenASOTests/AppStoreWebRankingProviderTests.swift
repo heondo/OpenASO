@@ -180,7 +180,37 @@ struct AppStoreWebRankingProviderTests {
     }
 
     @Test
-    func incompleteLookupHydrationFailsWithoutShiftingRanks() async throws {
+    func partialLookupHydrationKeepsSurvivorsAtTrueSearchPositions() async throws {
+        let client = MockHTTPClient { request in
+            let url = try #require(request.url)
+            if url.host() == "apps.apple.com" {
+                return (
+                    Self.hydrationReferencesFixture(ids: [10, 20, 30, 40, 50]),
+                    makeHTTPURLResponse(url: url, statusCode: 200)
+                )
+            }
+            return (
+                Self.lookupFixture(ids: [50, 40, 20, 10]),
+                makeHTTPURLResponse(url: url, statusCode: 200)
+            )
+        }
+
+        let page = try await AppStoreWebRankingProvider(httpClient: client).search(
+            keyword: "notes",
+            storefrontCode: "us",
+            platform: .iphone,
+            limit: 5
+        )
+
+        #expect(page.source == .appStoreWeb)
+        #expect(page.fallbackContext == nil)
+        #expect(page.items.map(\.appStoreID) == [10, 20, 40, 50])
+        #expect(page.items.map(\.position) == [1, 2, 4, 5])
+        #expect(page.items.allSatisfy { $0.platform == .iphone })
+    }
+
+    @Test
+    func smallRequestToleratesOneMissingHydrationIDWithoutShiftingRanks() async throws {
         let client = MockHTTPClient { request in
             let url = try #require(request.url)
             if url.host() == "apps.apple.com" {
@@ -191,6 +221,60 @@ struct AppStoreWebRankingProviderTests {
             }
             return (
                 Self.incompleteHydrationLookupFixture,
+                makeHTTPURLResponse(url: url, statusCode: 200)
+            )
+        }
+
+        let page = try await AppStoreWebRankingProvider(httpClient: client).search(
+            keyword: "notes",
+            storefrontCode: "us",
+            platform: .iphone,
+            limit: 3
+        )
+
+        #expect(page.items.map(\.appStoreID) == [30, 20])
+        #expect(page.items.map(\.position) == [1, 3])
+        #expect(page.items.map(\.name) == ["Thirty", "Twenty"])
+    }
+
+    @Test
+    func lookupHydrationMissingAboveToleranceStillFails() async throws {
+        let client = MockHTTPClient { request in
+            let url = try #require(request.url)
+            if url.host() == "apps.apple.com" {
+                return (
+                    Self.hydrationReferencesFixture(ids: [10, 20, 30, 40, 50]),
+                    makeHTTPURLResponse(url: url, statusCode: 200)
+                )
+            }
+            return (
+                Self.lookupFixture(ids: [10, 50]),
+                makeHTTPURLResponse(url: url, statusCode: 200)
+            )
+        }
+
+        await Self.expectResponseFailure(.lookupHydrationIncomplete) {
+            _ = try await AppStoreWebRankingProvider(httpClient: client).search(
+                keyword: "notes",
+                storefrontCode: "us",
+                platform: .iphone,
+                limit: 5
+            )
+        }
+    }
+
+    @Test
+    func emptyLookupResponseForNonEmptyRequestStillFails() async throws {
+        let client = MockHTTPClient { request in
+            let url = try #require(request.url)
+            if url.host() == "apps.apple.com" {
+                return (
+                    Self.hydrationFixture,
+                    makeHTTPURLResponse(url: url, statusCode: 200)
+                )
+            }
+            return (
+                Data(#"{"results":[]}"#.utf8),
                 makeHTTPURLResponse(url: url, statusCode: 200)
             )
         }
@@ -634,6 +718,24 @@ struct AppStoreWebRankingProviderTests {
       {"trackId":20,"trackName":"Twenty"}
     ]}
     """.utf8)
+
+    private static func hydrationReferencesFixture(ids: [Int64]) -> Data {
+        let references = ids
+            .map { #"{"id":"\#($0)","type":"apps","href":"/v1/catalog/us/apps/\#($0)"}"# }
+            .joined(separator: ",")
+        return Data("""
+        <script id="serialized-server-data">
+        {"data":[{"intent":{"term":"notes","storefront":"us","platform":"iphone","$kind":"SearchResultsPageIntent"},"data":{"$kind":"SearchResultsPage","nextPage":{"results":[\(references)]},"shelves":[{"id":"SearchResults.shelfId","$kind":"Shelf","contentType":"searchResult","items":[]}]}}]}
+        </script>
+        """.utf8)
+    }
+
+    private static func lookupFixture(ids: [Int64]) -> Data {
+        let results = ids
+            .map { #"{"trackId":\#($0),"trackName":"App \#($0)","bundleId":"com.example.app\#($0)","sellerName":"Example"}"# }
+            .joined(separator: ",")
+        return Data(#"{"results":[\#(results)]}"#.utf8)
+    }
 
     private static let fallbackPage = SearchRankingPage(
         items: [SearchRankingItem(

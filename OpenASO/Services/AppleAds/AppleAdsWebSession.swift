@@ -8,24 +8,68 @@ struct AppleAdsWebSession: Codable, Equatable, Sendable {
     var updatedAt: Date
     var accountName: String?
     var linkedApps: [AppleAdsPromotedApp]?
+    /// Optional so sessions stored before the cookie jar existed still decode; `jarCookies`
+    /// rehydrates those from `cookieHeader`.
+    var cookies: [AppleAdsCookie]?
 
     init(
         cookieHeader: String,
         xsrfToken: String,
         updatedAt: Date,
         accountName: String? = nil,
-        linkedApps: [AppleAdsPromotedApp]? = nil
+        linkedApps: [AppleAdsPromotedApp]? = nil,
+        cookies: [AppleAdsCookie]? = nil
     ) {
         self.cookieHeader = cookieHeader
         self.xsrfToken = xsrfToken
         self.updatedAt = updatedAt
         self.accountName = accountName
         self.linkedApps = linkedApps
+        self.cookies = cookies
     }
 
     var isComplete: Bool {
-        !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !xsrfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasCookies = !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasLegacyAuthentication = !xsrfToken
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        let cookieNames = Set(AppleAdsPastedSession.cookiePairs(in: cookieHeader).map(\.name))
+        let hasModernAuthentication = cookieNames.contains(AppleAdsSessionCookies.session)
+            && cookieNames.contains(AppleAdsSessionCookies.authenticatedSession)
+
+        return hasCookies && (hasLegacyAuthentication || hasModernAuthentication)
+    }
+
+    /// Identifies a connected session across cookie rotation, which rewrites `cookieHeader`,
+    /// `xsrfToken`, and `cookies` but deliberately leaves `updatedAt` alone.
+    var connectionIdentity: Date {
+        updatedAt
+    }
+
+    /// The jar contents for this session. Sessions stored before the jar only kept a flat `Cookie:`
+    /// string, so those come back as plain host cookies.
+    var jarCookies: [AppleAdsCookie] {
+        if let cookies {
+            return cookies
+        }
+        return AppleAdsPastedSession.cookiePairs(in: cookieHeader).map {
+            AppleAdsCookie(name: $0.name, value: $0.value)
+        }
+    }
+
+    /// Folds rotated cookies back into the session that gets persisted, keeping `cookieHeader` and
+    /// `xsrfToken` in step with the jar.
+    ///
+    /// `updatedAt` stays put on purpose: rotation is the session continuing to work, not the user
+    /// reconnecting, and both the UI and `connectionIdentity` read it as the moment of connection.
+    func refreshed(with cookies: [AppleAdsCookie]) -> AppleAdsWebSession {
+        var session = self
+        session.cookies = cookies
+        session.cookieHeader = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+        session.xsrfToken = cookies.first {
+            $0.name == AppleAdsSessionCookies.xsrfToken
+        }?.value ?? ""
+        return session
     }
 }
 
@@ -39,7 +83,8 @@ struct AppleAdsWebSessionExpiredError: LocalizedError, Equatable, Sendable {
 
 private func appleAdsWebJSONResponse(
     for request: URLRequest,
-    using client: HTTPClient
+    using client: HTTPClient,
+    jar: AppleAdsCookieJar
 ) async throws -> (data: Data, response: HTTPURLResponse) {
     try Task.checkCancellation()
     let (data, response) = try await client.data(for: request)
@@ -47,6 +92,10 @@ private func appleAdsWebJSONResponse(
     guard let httpResponse = response as? HTTPURLResponse else {
         throw OpenASOError.unexpectedResponse
     }
+
+    // Ahead of the status checks: Apple rotates session cookies on ordinary responses, and uses
+    // failures to retire them. Both are things the jar needs to hear about.
+    jar.ingest(response: httpResponse)
 
     if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
         throw AppleAdsWebSessionExpiredError()
@@ -105,9 +154,10 @@ private func isHTMLResponse(data: Data, response: HTTPURLResponse) -> Bool {
 
 private func validatedAppleAdsWebData(
     for request: URLRequest,
-    using client: HTTPClient
+    using client: HTTPClient,
+    jar: AppleAdsCookieJar
 ) async throws -> Data {
-    let result = try await appleAdsWebJSONResponse(for: request, using: client)
+    let result = try await appleAdsWebJSONResponse(for: request, using: client, jar: jar)
     switch result.response.statusCode {
     case 200 ..< 300:
         return result.data
@@ -164,6 +214,11 @@ final class AppleAdsWebSessionStore {
     private(set) var requiresReconnect: Bool
     private var shouldRetryTransientRead: Bool
 
+    /// The cookies every Apple Ads request reads from and every Apple Ads response writes back to.
+    /// Handed to the request builders rather than copied, so rotation during a refresh is visible to
+    /// the calls that follow it.
+    let cookieJar: AppleAdsCookieJar
+
     init(
         defaults: UserDefaults = .openASOShared,
         keychain: any KeychainService = SystemKeychainService(),
@@ -177,19 +232,22 @@ final class AppleAdsWebSessionStore {
         self.keychain = keychain
         self.keychainService = keychainService
         self.reconnectRequiredDefaultsKey = reconnectRequiredDefaultsKey
+        let storedSession: AppleAdsWebSession?
         if keychainItemPresence.contains(service: keychainService, account: Self.sessionAccount) {
             let state = Self.readState(
                 service: keychainService,
                 account: Self.sessionAccount,
                 keychain: keychain
             )
-            session = state.session
+            storedSession = state.session
             shouldRetryTransientRead = state.shouldRetryTransientFailure
         } else {
-            session = nil
+            storedSession = nil
             shouldRetryTransientRead = false
         }
+        session = storedSession
         requiresReconnect = defaults.bool(forKey: reconnectRequiredDefaultsKey)
+        cookieJar = AppleAdsCookieJar(cookies: storedSession?.jarCookies ?? [])
     }
 
     var hasSession: Bool {
@@ -212,6 +270,7 @@ final class AppleAdsWebSessionStore {
         )
         if let recoveredSession = state.session {
             session = recoveredSession
+            cookieJar.replaceAll(with: recoveredSession.jarCookies)
         }
         shouldRetryTransientRead = state.shouldRetryTransientFailure
         return session
@@ -223,6 +282,7 @@ final class AppleAdsWebSessionStore {
             try keychain.save(data, service: keychainService, account: Self.sessionAccount)
             keychainItemPresence.markPresent(service: keychainService, account: Self.sessionAccount)
             self.session = session
+            cookieJar.replaceAll(with: session.jarCookies)
             setReconnectRequired(false)
             shouldRetryTransientRead = false
         } catch {
@@ -230,17 +290,42 @@ final class AppleAdsWebSessionStore {
         }
     }
 
+    /// Writes cookies Apple rotated during a run back to the Keychain, so the next launch starts from
+    /// the live session instead of the snapshot taken at sign-in.
+    ///
+    /// Deliberately not `save(_:)`: rotation must not clear a pending reconnect requirement.
+    func persistRotatedCookies() {
+        guard cookieJar.hasUnsavedRotation, let session else { return }
+
+        let rotated = session.refreshed(with: cookieJar.snapshot())
+        guard rotated != session else {
+            cookieJar.markPersisted()
+            return
+        }
+
+        do {
+            let data = try JSONEncoder().encode(rotated)
+            try keychain.save(data, service: keychainService, account: Self.sessionAccount)
+            keychainItemPresence.markPresent(service: keychainService, account: Self.sessionAccount)
+            self.session = rotated
+            cookieJar.markPersisted()
+        } catch {
+            // Only costs freshness on the next launch — the in-memory jar keeps this run working.
+            Self.logger.warning("Could not persist rotated Apple Ads cookies to Keychain")
+        }
+    }
+
     func requiresReconnect(for session: AppleAdsWebSession) -> Bool {
-        requiresReconnect && self.session == session
+        requiresReconnect && isCurrent(session)
     }
 
     func markReconnectRequired(for session: AppleAdsWebSession) {
-        guard self.session == session else { return }
+        guard isCurrent(session) else { return }
         setReconnectRequired(true)
     }
 
     func clearReconnectRequirement(for session: AppleAdsWebSession) {
-        guard self.session == session else { return }
+        guard isCurrent(session) else { return }
         setReconnectRequired(false)
     }
 
@@ -248,8 +333,16 @@ final class AppleAdsWebSessionStore {
         keychain.delete(service: keychainService, account: Self.sessionAccount)
         keychainItemPresence.markAbsent(service: keychainService, account: Self.sessionAccount)
         session = nil
+        cookieJar.removeAll()
         setReconnectRequired(false)
         shouldRetryTransientRead = false
+    }
+
+    /// Callers hold the session value they started their work with. Rotation rewrites the stored
+    /// copy's cookies, so identity — not equality — decides whether that work is still about the
+    /// session in hand.
+    private func isCurrent(_ session: AppleAdsWebSession) -> Bool {
+        self.session?.connectionIdentity == session.connectionIdentity
     }
 
     private func setReconnectRequired(_ isRequired: Bool) {
@@ -293,6 +386,10 @@ final class AppleAdsWebSessionManager {
     private var capturedLinkedApps: [AppleAdsPromotedApp] = []
     private var capturedAccountName: String?
 
+    private var cookieJar: AppleAdsCookieJar {
+        sessionStore.cookieJar
+    }
+
     init(
         sessionStore: AppleAdsWebSessionStore,
         settingsStore: AppSettingsStore,
@@ -321,7 +418,8 @@ final class AppleAdsWebSessionManager {
             xsrfToken: capture.xsrfToken,
             updatedAt: .now,
             accountName: capture.accountName,
-            linkedApps: nil
+            linkedApps: nil,
+            cookies: capture.cookies
         )
         try sessionStore.save(session)
         capturedLinkedApps = []
@@ -360,8 +458,10 @@ final class AppleAdsWebSessionManager {
         }
 
         let storefrontCode = settingsStore.popularityContextStorefrontCode ?? "US"
+        defer { sessionStore.persistRotatedCookies() }
+
         do {
-            guard let popularity = try await AppleAdsCMPopularityClient(httpClient: httpClient)
+            guard let popularity = try await AppleAdsCMPopularityClient(httpClient: httpClient, cookieJar: cookieJar)
                 .keywordPopularity(for: keyword, storefrontCode: storefrontCode, adamId: adamId, session: session)
             else {
                 throw OpenASOError.providerUnavailable("Apple Ads web session worked, but the keyword returned no popularity.")
@@ -372,8 +472,6 @@ final class AppleAdsWebSessionManager {
         } catch let error as AppleAdsWebSessionExpiredError {
             sessionStore.markReconnectRequired(for: session)
             throw error
-        } catch {
-            throw error
         }
     }
 
@@ -381,6 +479,8 @@ final class AppleAdsWebSessionManager {
         guard let session = sessionStore.recoverSessionIfNeeded(), session.isComplete else {
             throw OpenASOError.providerUnavailable("Connect an Apple Ads web session first.")
         }
+
+        defer { sessionStore.persistRotatedCookies() }
 
         do {
             if let app = capturedLinkedApps.first ?? session.linkedApps?.first {
@@ -446,15 +546,14 @@ final class AppleAdsWebSessionManager {
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
-        request.setValue(session.xsrfToken, forHTTPHeaderField: "X-XSRF-TOKEN-CM")
+        request.applyAppleAdsSession(session, jar: cookieJar)
         request.setValue("https://app-ads.apple.com", forHTTPHeaderField: "Origin")
         request.setValue("https://app-ads.apple.com/cm/app", forHTTPHeaderField: "Referer")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
         request.httpBody = try JSONEncoder().encode(Self.reportingCampaignAppsRequest())
 
         do {
-            let data = try await validatedAppleAdsWebData(for: request, using: httpClient)
+            let data = try await validatedAppleAdsWebData(for: request, using: httpClient, jar: cookieJar)
             let response = try JSONDecoder().decode(ReportingCampaignAppsResponse.self, from: data)
             return Self.reportingCampaignApps(from: response)
         } catch {
@@ -469,8 +568,7 @@ final class AppleAdsWebSessionManager {
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
-        request.setValue(session.xsrfToken, forHTTPHeaderField: "X-XSRF-TOKEN-CM")
+        request.applyAppleAdsSession(session, jar: cookieJar)
         request.setValue("https://app-ads.apple.com", forHTTPHeaderField: "Origin")
         request.setValue("https://app-ads.apple.com/", forHTTPHeaderField: "Referer")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
@@ -479,7 +577,7 @@ final class AppleAdsWebSessionManager {
             forHTTPHeaderField: "User-Agent"
         )
 
-        return try await validatedAppleAdsWebData(for: request, using: httpClient)
+        return try await validatedAppleAdsWebData(for: request, using: httpClient, jar: cookieJar)
     }
 
     private func fetchSellerApps(named sellerName: String) async throws -> [AppleAdsPromotedApp] {
@@ -784,9 +882,11 @@ struct AppleAdsCMPopularityClient {
     static let maxTermsPerRequest = 100
 
     private let httpClient: HTTPClient
+    private let cookieJar: AppleAdsCookieJar
 
-    init(httpClient: HTTPClient) {
+    init(httpClient: HTTPClient, cookieJar: AppleAdsCookieJar) {
         self.httpClient = httpClient
+        self.cookieJar = cookieJar
     }
 
     func keywordPopularity(
@@ -848,8 +948,7 @@ struct AppleAdsCMPopularityClient {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
-        request.setValue(session.xsrfToken, forHTTPHeaderField: "X-XSRF-TOKEN-CM")
+        request.applyAppleAdsSession(session, jar: cookieJar)
         request.setValue("https://app-ads.apple.com", forHTTPHeaderField: "Origin")
         request.setValue("https://app-ads.apple.com/", forHTTPHeaderField: "Referer")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
@@ -887,7 +986,7 @@ struct AppleAdsCMPopularityClient {
         storefrontCode: String,
         using client: HTTPClient
     ) async throws -> Data {
-        let result = try await appleAdsWebJSONResponse(for: request, using: client)
+        let result = try await appleAdsWebJSONResponse(for: request, using: client, jar: cookieJar)
 
         switch result.response.statusCode {
         case 200 ..< 300:

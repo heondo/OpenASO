@@ -4,7 +4,7 @@ import Observation
 @MainActor
 final class KeywordWorkspaceModel {
     typealias MaterializationOperation = @MainActor () async throws -> [KeywordWorkspaceRow]
-    typealias FilterOperation = @MainActor (
+    typealias FilterOperation = (
         _ rows: [KeywordWorkspaceRow],
         _ filters: KeywordWorkspaceProjection.Filters
     ) async throws -> [KeywordWorkspaceRow]
@@ -167,41 +167,22 @@ final class KeywordWorkspaceModel {
 
     func applyUpdatedRows(
         _ updatedRowsByIdentityKey: [String: KeywordInsightsService.Workspace.Row]
-    ) {
+    ) async {
         guard !updatedRowsByIdentityKey.isEmpty,
               !publication.materializedRows.isEmpty
         else {
             return
         }
 
-        var didChange = false
-        let materializedRows = publication.materializedRows.map { row in
-            guard let update = updatedRowsByIdentityKey[row.track.identityKey] else {
-                return row
-            }
-
-            let updatedRow = row.updating(
-                metrics: update.metrics,
-                estimatedDifficulty: update.estimatedDifficulty,
-                refreshStatus: update.refreshStatus,
-                latestSnapshot: update.latestSnapshot,
-                trendSnapshots: update.trendSnapshots,
-                rankingApps: update.rankingApps
-            )
-            if updatedRow != row {
-                didChange = true
-            }
-            return updatedRow
-        }
-        guard didChange else { return }
-
         let filters = desiredFilters ?? publication.appliedFilterID?.filters
-        let rows = filters.map {
-            KeywordWorkspaceProjection.filteredRows(materializedRows, filters: $0)
-        } ?? materializedRows
+        guard let update = await KeywordWorkspaceProjection.applyingUpdates(
+            updatedRowsByIdentityKey,
+            to: publication.materializedRows,
+            filters: filters
+        ) else { return }
         publication = Publication(
-            materializedRows: materializedRows,
-            rows: rows,
+            materializedRows: update.materializedRows,
+            rows: update.rows,
             // Summary charts are intentionally finalized by the full refresh
             // publication. Rebuilding all history for every row delta was a
             // measurable source of refresh-time main-thread work.

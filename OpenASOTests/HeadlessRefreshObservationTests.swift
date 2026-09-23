@@ -267,9 +267,9 @@ struct HeadlessRefreshObservationTests {
         )
 
         #expect(started.redactedLogMessage == "Headless refresh started runID=\(runID.uuidString)")
-        #expect(planLoaded.redactedLogMessage == nil)
-        #expect(appStarted.redactedLogMessage == nil)
-        #expect(appFinished.redactedLogMessage == nil)
+        #expect(planLoaded.redactedLogMessage == "Headless refresh plan loaded runID=\(runID.uuidString) planned=7")
+        #expect(appStarted.redactedLogMessage == "Headless refresh app started runID=\(runID.uuidString) appStoreID=\(appStoreID) position=1 total=7")
+        #expect(appFinished.redactedLogMessage == "Headless refresh app finished runID=\(runID.uuidString) appStoreID=\(appStoreID) position=1 total=7 disposition=failure")
         #expect(finished.redactedLogMessage == expectedSummaryMessage)
         #expect(skipped.redactedLogMessage == "Headless refresh skipped requestRunID=\(runID.uuidString) activeRunID=\(activeRunID.uuidString)")
         #expect(reused.redactedLogMessage == "Headless refresh reused requestRunID=\(runID.uuidString) priorDisposition=partialFailure")
@@ -303,6 +303,9 @@ struct HeadlessRefreshObservationTests {
         let messages = logRecorder.values()
         #expect(messages == [
             started.redactedLogMessage,
+            planLoaded.redactedLogMessage,
+            appStarted.redactedLogMessage,
+            appFinished.redactedLogMessage,
             expectedSummaryMessage,
             skipped.redactedLogMessage,
             reused.redactedLogMessage,
@@ -313,7 +316,6 @@ struct HeadlessRefreshObservationTests {
 
         let renderedMessages = messages.joined(separator: " ").lowercased()
         for sentinel in [
-            String(appStoreID),
             "secret-app-name-sentinel",
             "com.example.secret-bundle-sentinel",
             "secret-keyword-sentinel",
@@ -323,6 +325,67 @@ struct HeadlessRefreshObservationTests {
             "secret-raw-error-sentinel",
         ] {
             #expect(!renderedMessages.contains(sentinel.lowercased()))
+        }
+    }
+
+    @Test
+    func liveAndPersistedPresentationsSeparateFailuresFromReconnectAdvisories() throws {
+        let runID = UUID()
+        let instant = Date(timeIntervalSince1970: 7_000)
+        let diagnostics = [
+            HeadlessRefreshDiagnostic(
+                appStoreID: 6_761_003_558,
+                stage: .metadata,
+                provider: .appStoreWeb,
+                storefront: "us",
+                severity: .failure,
+                reasonCode: .validationFailed
+            ),
+            HeadlessRefreshDiagnostic(
+                appStoreID: 6_761_003_558,
+                stage: .keywordMetrics,
+                provider: .appleAdsWeb,
+                severity: .advisory,
+                reasonCode: .sessionExpired
+            ),
+        ]
+        let summary = makeSummary(
+            runID: runID,
+            instant: instant,
+            disposition: .partialFailure,
+            plannedAppCount: 1,
+            completedAppCount: 1,
+            successfulAppCount: 0,
+            partialFailureAppCount: 1,
+            failedAppCount: 0,
+            issue: HeadlessRefreshIssue(kind: .appRefreshFailed),
+            diagnostics: diagnostics
+        )
+        let live = try #require(DailyRefreshRunStatusPresentation(
+            activeRun: nil,
+            latestRun: summary
+        ))
+        let persisted = try #require(DailyRefreshRunStatusPresentation(
+            activeRun: nil,
+            latestRun: nil,
+            persistedRun: BackgroundRefreshRunRecord(
+                summary: summary,
+                executionOrigin: .oneShot,
+                buildIdentity: .init(shortVersion: "2.0", buildVersion: "100")
+            )
+        ))
+
+        for presentation in [live, persisted] {
+            #expect(presentation.facts
+                == "Completed 1 of 1 app: 0 succeeded, 1 partial, 0 failed.")
+            #expect(presentation.issueMessage
+                == "Metadata from App Store web could not be validated for storefront US.")
+            #expect(presentation.diagnosticMessages
+                == ["Metadata from App Store web could not be validated for storefront US."])
+            #expect(presentation.reconnectAdvisory
+                == "Reconnect Apple Ads in Settings. Popularity was not refreshed.")
+            #expect(presentation.accessibilityValue.contains("0 succeeded, 1 partial, 0 failed"))
+            #expect(presentation.accessibilityValue.contains("Reconnect Apple Ads"))
         }
     }
 
@@ -565,7 +628,8 @@ private func makeSummary(
     failedAppCount: Int,
     ratingsReviewsAttempted: Bool = false,
     ratingsReviewsFullySucceeded: Bool = false,
-    issue: HeadlessRefreshIssue?
+    issue: HeadlessRefreshIssue?,
+    diagnostics: [HeadlessRefreshDiagnostic] = []
 ) -> HeadlessRefreshRunSummary {
     HeadlessRefreshRunSummary(
         runID: runID,
@@ -581,7 +645,8 @@ private func makeSummary(
         failedAppCount: failedAppCount,
         ratingsReviewsAttempted: ratingsReviewsAttempted,
         ratingsReviewsFullySucceeded: ratingsReviewsFullySucceeded,
-        issue: issue
+        issue: issue,
+        diagnostics: diagnostics
     )
 }
 
@@ -594,6 +659,8 @@ private func presentationText(
         presentation.systemImage,
         presentation.facts,
         presentation.issueMessage,
+        presentation.diagnosticMessages.joined(separator: " "),
+        presentation.reconnectAdvisory,
         presentation.accessibilityLabel,
         presentation.accessibilityValue,
     ]

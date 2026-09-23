@@ -121,7 +121,6 @@ enum KeywordWorkspaceProjection {
         }
     }
 
-    @MainActor
     static func debouncedRows(
         _ rows: [KeywordWorkspaceRow],
         filters: Filters,
@@ -130,6 +129,32 @@ enum KeywordWorkspaceProjection {
         try await Task.sleep(for: delay)
         try Task.checkCancellation()
         return filteredRows(rows, filters: filters)
+    }
+
+    static func applyingUpdates(
+        _ updates: [String: KeywordInsightsService.Workspace.Row],
+        to rows: [KeywordWorkspaceRow],
+        filters: Filters?
+    ) async -> (materializedRows: [KeywordWorkspaceRow], rows: [KeywordWorkspaceRow])? {
+        var didChange = false
+        let materializedRows = rows.map { row in
+            guard let update = updates[row.track.identityKey] else { return row }
+            let updatedRow = row.updating(
+                metrics: update.metrics,
+                estimatedDifficulty: update.estimatedDifficulty,
+                refreshStatus: update.refreshStatus,
+                latestSnapshot: update.latestSnapshot,
+                trendSnapshots: update.trendSnapshots,
+                rankingApps: update.rankingApps
+            )
+            didChange = didChange || updatedRow != row
+            return updatedRow
+        }
+        guard didChange else { return nil }
+        return (
+            materializedRows,
+            filters.map { filteredRows(materializedRows, filters: $0) } ?? materializedRows
+        )
     }
 
     private static func matchesSearch(_ row: KeywordWorkspaceRow, searchText: String) -> Bool {
