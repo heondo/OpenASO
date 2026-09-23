@@ -20,13 +20,16 @@ struct OpenASOMCPServerConfiguration: Sendable {
 struct OpenASOMCPServerFactory: Sendable {
     let service: OpenASOMCPService
     let configuration: OpenASOMCPServerConfiguration
+    let dailyRefreshSchedule: OpenASOMCPDailyRefreshScheduleControl
 
     init(
         service: OpenASOMCPService,
-        configuration: OpenASOMCPServerConfiguration = OpenASOMCPServerConfiguration()
+        configuration: OpenASOMCPServerConfiguration = OpenASOMCPServerConfiguration(),
+        dailyRefreshSchedule: OpenASOMCPDailyRefreshScheduleControl = .live()
     ) {
         self.service = service
         self.configuration = configuration
+        self.dailyRefreshSchedule = dailyRefreshSchedule
     }
 
     func makeServer() async -> Server {
@@ -239,6 +242,21 @@ struct OpenASOMCPServerFactory: Sendable {
                 tags: try arguments.requiredStringArray("tags", allowEmpty: true)
             )
             return try Self.toolResult(result)
+
+        case "get_daily_refresh_schedule":
+            return try Self.toolResult(await dailyRefreshSchedule.status())
+
+        case "set_daily_refresh_schedule":
+            let time = try arguments.string("time").map(OpenASOMCPDailyRefreshScheduleControl.parseTime)
+            let enabled = arguments.bool("enabled")
+            guard time != nil || enabled != nil else {
+                throw MCPError.invalidParams("Pass time (HH:mm, 24-hour local time), enabled, or both.")
+            }
+            return try Self.toolResult(await dailyRefreshSchedule.update(
+                enabled,
+                time?.hour,
+                time?.minute
+            ))
 
         case "list_screenshots":
             let result = try await service.listScreenshots(
@@ -535,6 +553,12 @@ private extension OpenASOMCPServerFactory {
             tool("update_keyword_tags", "Replace the full free-form tag list on one tracked keyword; pass the complete list, and an empty list clears it. Tags group keywords for table filtering and automation, for example release-version tags like v2.0.2 or v3.0-3.1, or brand.", schema(
                 required: ["appStoreID", "keyword", "storefront", "tags"],
                 optional: ["appStoreID": .integer, "keyword": .string, "storefront": .string, "platform": .string, "tags": .stringArray]
+            ), readOnly: false, destructive: false, idempotent: true),
+            tool("get_daily_refresh_schedule", "Get the automatic daily refresh schedule (enabled, local HH:mm time, next scheduled run) and the last run's outcome: disposition, app counts, stage diagnostics, whether the GUI or the background agent ran it, plus any interrupted attempt.", schema(
+                optional: [:]
+            ), readOnly: true),
+            tool("set_daily_refresh_schedule", "Change the automatic daily refresh time (HH:mm, 24-hour local time) and/or enable or disable it. Moving the time later today re-arms today's run even if an earlier run already happened today. The open app picks up the change immediately; the background agent checks once an hour.", schema(
+                optional: ["time": .string, "enabled": .boolean]
             ), readOnly: false, destructive: false, idempotent: true),
             tool("list_screenshots", "List stored App Store screenshot metadata.", schema(
                 required: ["appStoreID"],
@@ -1040,5 +1064,137 @@ private extension ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: value)
+    }
+}
+
+
+/// MCP/API control over the automatic daily refresh schedule.
+///
+/// It writes the same defaults keys as Settings through `AppSettingsStore`, then posts
+/// `DailyRefreshScheduleChangeSignal` so a running GUI restarts its in-app scheduler at once.
+struct OpenASOMCPDailyRefreshScheduleControl: Sendable {
+    let status: @Sendable () async -> OpenASOMCPDailyRefreshScheduleStatus
+    let update: @Sendable (_ enabled: Bool?, _ hour: Int?, _ minute: Int?) async
+        -> OpenASOMCPDailyRefreshScheduleStatus
+
+    static func live(
+        defaults: @escaping @Sendable () -> UserDefaults = { .openASOShared },
+        namespace: AppNamespace = .current,
+        now: @escaping @Sendable () -> Date = { .now },
+        calendar: Calendar = .current
+    ) -> Self {
+        Self(
+            status: {
+                await MainActor.run {
+                    OpenASOMCPDailyRefreshScheduleStatus(
+                        store: AppSettingsStore(defaults: defaults()),
+                        defaults: defaults(),
+                        now: now(),
+                        calendar: calendar,
+                        claimReleased: nil
+                    )
+                }
+            },
+            update: { enabled, hour, minute in
+                let result = await MainActor.run {
+                    let store = AppSettingsStore(defaults: defaults())
+                    let currentTime = now()
+                    let released = store.rescheduleAutomaticRefresh(
+                        isEnabled: enabled,
+                        hour: hour,
+                        minute: minute,
+                        now: currentTime,
+                        calendar: calendar
+                    )
+                    return OpenASOMCPDailyRefreshScheduleStatus(
+                        store: store,
+                        defaults: defaults(),
+                        now: currentTime,
+                        calendar: calendar,
+                        claimReleased: released
+                    )
+                }
+                DailyRefreshScheduleChangeSignal.post(namespace: namespace)
+                return result
+            }
+        )
+    }
+
+    static func parseTime(_ value: String) throws -> (hour: Int, minute: Int) {
+        let parts = value.trimmingCharacters(in: .whitespaces).split(separator: ":")
+        guard parts.count == 2,
+              let hour = Int(parts[0]), let minute = Int(parts[1]),
+              (0...23).contains(hour), (0...59).contains(minute)
+        else {
+            throw MCPError.invalidParams("time must be HH:mm in 24-hour local time, for example 05:00 or 14:35.")
+        }
+        return (hour, minute)
+    }
+}
+
+struct OpenASOMCPDailyRefreshScheduleStatus: Codable, Sendable {
+    struct ActiveAttempt: Codable, Sendable {
+        let runID: UUID
+        let claimedAt: Date
+        let scheduledFor: Date
+        let lastPhase: String
+        let executionOrigin: String
+    }
+
+    let automaticRefreshEnabled: Bool
+    let refreshTime: String
+    let timeZone: String
+    let nextScheduledAt: Date?
+    let dueNow: Bool
+    let claimedToday: Bool
+    let lastClaimedAt: Date?
+    let claimReleased: Bool?
+    let lastAgentWakeAt: Date?
+    let lastRun: BackgroundRefreshRunRecord?
+    let activeAttempt: ActiveAttempt?
+    let notes: [String]
+
+    @MainActor
+    init(
+        store: AppSettingsStore,
+        defaults: UserDefaults,
+        now: Date,
+        calendar: Calendar,
+        claimReleased: Bool?
+    ) {
+        store.reloadAutomaticRefreshSchedule()
+        let lastClaimedAt = store.lastAutomaticRefreshClaimedAt
+        let decision = DailyRefreshDuePolicy.evaluate(
+            configuration: store.scheduleConfiguration,
+            lastClaimedAt: lastClaimedAt,
+            now: now,
+            calendar: calendar
+        )
+        automaticRefreshEnabled = store.isAutomaticRefreshEnabled
+        refreshTime = String(format: "%02d:%02d", store.refreshHour, store.refreshMinute)
+        timeZone = calendar.timeZone.identifier
+        dueNow = decision.dueSlot != nil
+        nextScheduledAt = decision.dueSlot?.scheduledFor ?? decision.nextCheckAt
+        claimedToday = store.hasClaimedAutomaticRefresh(on: now, calendar: calendar)
+        self.lastClaimedAt = lastClaimedAt
+        self.claimReleased = claimReleased
+        lastAgentWakeAt = defaults.object(
+            forKey: BackgroundRefreshAgentController.agentWakeDefaultsKey
+        ) as? Date
+        lastRun = store.lastBackgroundRefreshRun
+        activeAttempt = store.activeBackgroundRefreshAttempt.map {
+            ActiveAttempt(
+                runID: $0.runID,
+                claimedAt: $0.claimedAt,
+                scheduledFor: $0.scheduledFor,
+                lastPhase: $0.lastPhase,
+                executionOrigin: $0.executionOrigin.rawValue
+            )
+        }
+        notes = [
+            "Times are local to timeZone. The run happens once per day at or after refreshTime.",
+            "The open OpenASO app starts the run within a minute of refreshTime; with the app closed, the background agent starts it at the next top of the hour.",
+            "An activeAttempt left behind with no newer lastRun means that run was interrupted or timed out.",
+        ]
     }
 }

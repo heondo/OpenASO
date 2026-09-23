@@ -168,6 +168,7 @@ final class AppServices {
     private(set) var backgroundModelStore: BackgroundModelStore?
     private(set) var backgroundModelStoreRevision = 0
     private var inAppDailyRefreshSchedulerSupervisor: InAppDailyRefreshSchedulerSupervisor?
+    private var dailyRefreshScheduleChangeToken: Int32?
 
     init(
         httpClient: HTTPClient = URLSessionHTTPClient(),
@@ -596,6 +597,16 @@ final class AppServices {
             }
         inAppDailyRefreshSchedulerSupervisor = supervisor
         supervisor.start()
+
+        // An MCP/API schedule change lands in another process; pick it up now instead of at the
+        // loop's next wake, which can be tomorrow's slot.
+        if dailyRefreshScheduleChangeToken == nil {
+            dailyRefreshScheduleChangeToken = DailyRefreshScheduleChangeSignal.observe { [weak self] in
+                guard let self else { return }
+                self.settingsStore.reloadAutomaticRefreshSchedule()
+                self.restartInAppDailyRefreshScheduler()
+            }
+        }
     }
 
     /// `DailyRefreshScheduler.run()` returns for good once the schedule is disabled, and it can be

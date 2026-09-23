@@ -799,3 +799,127 @@ private func date(
         minute: minute
     ))!
 }
+
+@MainActor
+@Suite(.timeLimit(.minutes(1)))
+struct DailyRefreshRescheduleTests {
+    private let calendar = utcCalendar()
+
+    private func claimedStore(claimAt hour: Int, minute: Int = 0) -> (AppSettingsStore, UserDefaults) {
+        let defaults = makeDefaults()
+        let store = AppSettingsStore(defaults: defaults)
+        store.rescheduleAutomaticRefresh(isEnabled: true, hour: 5, minute: 0,
+                                         now: date(year: 2026, month: 9, day: 23, hour: 0, calendar: calendar),
+                                         calendar: calendar)
+        let claimTime = date(year: 2026, month: 9, day: 23, hour: hour, minute: minute, calendar: calendar)
+        #expect(store.evaluateAndClaimAutomaticRefresh(at: claimTime, calendar: calendar).claim != nil)
+        return (store, defaults)
+    }
+
+    @Test
+    func movingTheTimeLaterTodayReleasesTheEarlierClaimAndRunsAtTheNewTime() {
+        let (store, _) = claimedStore(claimAt: 5)
+        let now = date(year: 2026, month: 9, day: 23, hour: 14, minute: 0, calendar: calendar)
+
+        let released = store.rescheduleAutomaticRefresh(
+            isEnabled: nil, hour: 14, minute: 3, now: now, calendar: calendar)
+
+        #expect(released)
+        #expect(store.evaluateAndClaimAutomaticRefresh(at: now, calendar: calendar).claim == nil)
+        let atSlot = date(year: 2026, month: 9, day: 23, hour: 14, minute: 3, calendar: calendar)
+        let claim = store.evaluateAndClaimAutomaticRefresh(at: atSlot, calendar: calendar).claim
+        #expect(claim?.scheduledFor == atSlot)
+        let later = date(year: 2026, month: 9, day: 23, hour: 15, calendar: calendar)
+        #expect(store.evaluateAndClaimAutomaticRefresh(at: later, calendar: calendar).claim == nil)
+    }
+
+    @Test
+    func aSlotAlreadyInThePastKeepsTodaysClaim() {
+        let (store, _) = claimedStore(claimAt: 5)
+        let now = date(year: 2026, month: 9, day: 23, hour: 14, calendar: calendar)
+
+        #expect(!store.rescheduleAutomaticRefresh(
+            isEnabled: nil, hour: 9, minute: 0, now: now, calendar: calendar))
+        #expect(store.hasClaimedAutomaticRefresh(on: now, calendar: calendar))
+    }
+
+    @Test
+    func aClaimMadeAfterTheNewSlotIsKept() {
+        let (store, _) = claimedStore(claimAt: 5)
+        // Rescheduling to 04:00 tomorrow-style values earlier than the claim never re-runs today.
+        let now = date(year: 2026, month: 9, day: 23, hour: 4, minute: 30, calendar: calendar)
+        #expect(!store.rescheduleAutomaticRefresh(
+            isEnabled: nil, hour: 4, minute: 45, now: now, calendar: calendar))
+    }
+
+    @Test
+    func disablingNeverReleasesTheClaim() {
+        let (store, _) = claimedStore(claimAt: 5)
+        let now = date(year: 2026, month: 9, day: 23, hour: 14, calendar: calendar)
+        #expect(!store.rescheduleAutomaticRefresh(
+            isEnabled: false, hour: 14, minute: 3, now: now, calendar: calendar))
+        #expect(store.hasClaimedAutomaticRefresh(on: now, calendar: calendar))
+    }
+
+    @Test
+    func aLongLivedStoreHonorsAScheduleWrittenByAnotherStore() {
+        let defaults = makeDefaults()
+        let guiStore = AppSettingsStore(defaults: defaults)
+        #expect(guiStore.refreshTimeMinutes == 300)
+
+        let mcpStore = AppSettingsStore(defaults: defaults)
+        mcpStore.rescheduleAutomaticRefresh(
+            isEnabled: true, hour: 14, minute: 3,
+            now: date(year: 2026, month: 9, day: 23, hour: 14, calendar: calendar),
+            calendar: calendar)
+
+        let atSlot = date(year: 2026, month: 9, day: 23, hour: 14, minute: 3, calendar: calendar)
+        let claim = guiStore.evaluateAndClaimAutomaticRefresh(at: atSlot, calendar: calendar).claim
+        #expect(claim?.scheduledFor == atSlot)
+        #expect(guiStore.refreshTimeMinutes == 14 * 60 + 3)
+    }
+
+    @Test
+    func mcpTimeParsingAcceptsTwentyFourHourTimesOnly() throws {
+        let parsed = try OpenASOMCPDailyRefreshScheduleControl.parseTime(" 07:05 ")
+        #expect(parsed.hour == 7 && parsed.minute == 5)
+        #expect(try OpenASOMCPDailyRefreshScheduleControl.parseTime("23:59").hour == 23)
+        for invalid in ["24:00", "7", "07:60", "7pm", "", "07:05:00"] {
+            #expect(throws: (any Error).self) {
+                try OpenASOMCPDailyRefreshScheduleControl.parseTime(invalid)
+            }
+        }
+    }
+
+    @Test
+    func mcpScheduleControlReschedulesAndReportsStatus() async {
+        let suiteName = "daily.refresh.mcp.tests.\(UUID().uuidString)"
+        UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+        let calendar = calendar
+        let claimTime = date(year: 2026, month: 9, day: 23, hour: 5, calendar: calendar)
+        let now = date(year: 2026, month: 9, day: 23, hour: 14, calendar: calendar)
+        let defaults = UserDefaults(suiteName: suiteName)!
+        _ = AppSettingsStore(defaults: defaults)
+            .evaluateAndClaimAutomaticRefresh(at: claimTime, calendar: calendar)
+
+        let control = OpenASOMCPDailyRefreshScheduleControl.live(
+            defaults: { UserDefaults(suiteName: suiteName)! },
+            namespace: AppNamespace(bundleIdentifier: "daily.refresh.mcp.tests.\(UUID().uuidString)"),
+            now: { now },
+            calendar: calendar
+        )
+
+        let before = await control.status()
+        #expect(before.refreshTime == "05:00")
+        #expect(before.claimedToday)
+        #expect(before.claimReleased == nil)
+
+        let after = await control.update(nil, 14, 3)
+        #expect(after.refreshTime == "14:03")
+        #expect(after.claimReleased == true)
+        #expect(!after.claimedToday)
+        #expect(after.nextScheduledAt == date(year: 2026, month: 9, day: 23, hour: 14, minute: 3, calendar: calendar))
+        #expect(after.timeZone == "UTC" || after.timeZone == "GMT")
+    }
+}

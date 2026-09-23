@@ -1,3 +1,4 @@
+import notify
 import Foundation
 
 struct DailyRefreshScheduleConfiguration: Hashable, Sendable {
@@ -192,5 +193,37 @@ struct DailyRefreshScheduler: Sendable {
     private static func liveSleep(until date: Date) async throws {
         let seconds = max(0, date.timeIntervalSinceNow)
         try await Task.sleep(for: .seconds(seconds))
+    }
+}
+
+/// Cross-process "the daily schedule changed" signal.
+///
+/// The MCP server runs in its own process and writes the schedule straight to defaults. The GUI's
+/// in-app scheduler may be asleep until tomorrow's slot, so it listens for this Darwin
+/// notification and restarts its loop immediately. Scoped by bundle identifier so a dev build and
+/// the installed app never wake each other.
+enum DailyRefreshScheduleChangeSignal {
+    static func name(namespace: AppNamespace = .current) -> String {
+        "\(namespace.bundleIdentifier).dailyRefreshScheduleChanged"
+    }
+
+    static func post(namespace: AppNamespace = .current) {
+        notify_post(name(namespace: namespace))
+    }
+
+    /// Returns the registration token, or nil when registration failed. The handler runs on main.
+    static func observe(
+        namespace: AppNamespace = .current,
+        handler: @escaping @MainActor () -> Void
+    ) -> Int32? {
+        var token: Int32 = 0
+        let status = notify_register_dispatch(name(namespace: namespace), &token, .main) { _ in
+            MainActor.assumeIsolated { handler() }
+        }
+        return status == NOTIFY_STATUS_OK ? token : nil
+    }
+
+    static func cancel(token: Int32) {
+        notify_cancel(token)
     }
 }

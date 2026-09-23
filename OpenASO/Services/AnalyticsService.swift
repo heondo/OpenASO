@@ -291,6 +291,68 @@ final class AppSettingsStore {
     refreshTimeMinutes = minutes
   }
 
+  /// Re-reads the schedule from defaults. The MCP server runs in a separate process and writes
+  /// the same keys, so a long-lived GUI store must not keep evaluating a stale cached copy.
+  func reloadAutomaticRefreshSchedule() {
+    let storedIsEnabled =
+      (defaults.object(forKey: DefaultsKey.isAutomaticRefreshEnabled) as? Bool)
+      ?? Self.defaultIsAutomaticRefreshEnabled
+    let storedMinutes = Self.normalized(
+      minutes: (defaults.object(forKey: DefaultsKey.refreshTimeMinutes) as? Int)
+        ?? Self.defaultRefreshTimeMinutes)
+    if storedIsEnabled != isAutomaticRefreshEnabled {
+      isAutomaticRefreshEnabled = storedIsEnabled
+    }
+    if storedMinutes != refreshTimeMinutes {
+      refreshTimeMinutes = storedMinutes
+    }
+  }
+
+  /// Applies an externally requested schedule change (MCP/API).
+  ///
+  /// Moving today's slot to a time that is still ahead releases a claim made earlier today, so
+  /// "run at 14:05" means a run at 14:05 even if the 05:00 run already happened. A claim made at
+  /// or after the new slot, or a slot already in the past, keeps the day claimed as before.
+  /// Returns whether today's claim was released.
+  @discardableResult
+  func rescheduleAutomaticRefresh(
+    isEnabled: Bool?,
+    hour: Int?,
+    minute: Int?,
+    now: Date = .now,
+    calendar: Calendar = .current
+  ) -> Bool {
+    reloadAutomaticRefreshSchedule()
+    if let isEnabled {
+      setAutomaticRefreshEnabled(isEnabled)
+    }
+    if let hour, let minute {
+      saveRefreshTime(hour: hour, minute: minute)
+    }
+
+    let persistedClaim = defaults.object(
+      forKey: DefaultsKey.lastAutomaticRefreshClaimedAt
+    ) as? Date
+    guard isAutomaticRefreshEnabled,
+      let persistedClaim,
+      calendar.isDate(persistedClaim, inSameDayAs: now),
+      let slot = calendar.date(
+        bySettingHour: refreshTimeMinutes / 60,
+        minute: refreshTimeMinutes % 60,
+        second: 0,
+        of: now
+      ),
+      slot > now,
+      persistedClaim < slot
+    else {
+      return false
+    }
+
+    defaults.removeObject(forKey: DefaultsKey.lastAutomaticRefreshClaimedAt)
+    lastAutomaticRefreshClaimedAt = nil
+    return true
+  }
+
   func saveRefreshTime(from date: Date, calendar: Calendar = .current) {
     let components = calendar.dateComponents([.hour, .minute], from: date)
     saveRefreshTime(
@@ -338,6 +400,7 @@ final class AppSettingsStore {
     at date: Date,
     calendar: Calendar = .current
   ) -> DailyRefreshClaimEvaluation {
+    reloadAutomaticRefreshSchedule()
     let persistedClaim = defaults.object(
       forKey: DefaultsKey.lastAutomaticRefreshClaimedAt
     ) as? Date
